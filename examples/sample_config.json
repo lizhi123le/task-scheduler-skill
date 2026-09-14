@@ -1,0 +1,41 @@
+{
+  "tasks": [
+    {
+      "id": 1,
+      "name": "每日整理下载",
+      "command": "bash ~/.config/opencode/skills/task-scheduler/examples/daily_organize.sh",
+      "schedule_type": "daily",
+      "schedule_value": "02:00",
+      "status": "active",
+      "group": "文件管理"
+    },
+    {
+      "id": 2,
+      "name": "周报生成",
+      "command": "bash ~/.config/opencode/skills/task-scheduler/examples/weekly_report.sh",
+      "schedule_type": "weekly",
+      "schedule_value": "fri 17:00",
+      "status": "active",
+      "notify_on_success": "email",
+      "email": "admin@example.com",
+      "group": "报告生成"
+    },
+    {
+      "id": 3,
+      "name": "系统维护",
+      "command": "bash ~/.config/opencode/skills/task-scheduler/examples/system_maintenance.sh",
+      "schedule_type": "weekly",
+      "schedule_value": "sun 03:00",
+      "status": "active",
+      "group": "系统维护"
+    }
+  ],
+  "settings": {
+    "log_retention_days": 30,
+    "max_log_size_mb": 100,
+    "notification": {
+      "slack_webhook": null,
+      "email": null
+    }
+  }
+}

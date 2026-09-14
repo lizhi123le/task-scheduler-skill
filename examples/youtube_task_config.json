@@ -1,0 +1,33 @@
+{
+  "settings": {
+    "log_retention_days": 30,
+    "max_log_size_mb": 100,
+    "notification": {
+      "slack_webhook": null,
+      "email": null
+    }
+  },
+  "tasks": [
+    {
+      "id": 1,
+      "name": "YouTube每日热门视频",
+      "command": "python C:\\Users\\lizhi\\.config\\opencode\\skills\\task-scheduler\\examples\\youtube_daily.py",
+      "schedule_type": "daily",
+      "schedule_value": "12:00",
+      "status": "active",
+      "group": "视频下载",
+      "created_at": "2025-02-02T13:00:00",
+      "last_run": "2025-02-02T13:33:35",
+      "next_run": "2025-02-03T012:00:00",
+      "run_count": 1,
+      "fail_count": 0,
+      "depends_on": null,
+      "working_dir": null,
+      "env_vars": {},
+      "notify_on_success": null,
+      "notify_on_fail": null,
+      "slack_webhook": null,
+      "email": null
+    }
+  ]
+}

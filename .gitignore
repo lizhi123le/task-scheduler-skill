@@ -1,0 +1,13 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 运行态数据（任务库、日志）——不属源码
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.jsonl
+
+# 上游遗留的垃圾文件（名为 "]" 的 47 字节文件，见 README）
+]
