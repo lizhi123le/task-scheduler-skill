@@ -798,8 +798,16 @@ class TaskScheduler:
                 bad.append(f"StartWhenAvailable={parts.get('SWA')}")
             if parts.get("MIP") != "IgnoreNew":
                 bad.append(f"MultipleInstancesPolicy={parts.get('MIP')}")
-            if parts.get("state") != want_state:
-                bad.append(f"state={parts.get('state')}（期望 {want_state}）")
+            # 状态校验：Enable/Disable 的意图是「别把状态弄反」，而不是「必须在跑」。
+            # ⚠️ 已启用但当前空闲的 ScheduledTask，其 State 是 `Ready`
+            # （只有正在执行的那几秒才是 `Running`）。此前把期望硬写成 `Running`，
+            # 于是每次 add/enable 都会误报「电源设置未生效」——实测踩到（2026-09-15）。
+            st = parts.get("state")
+            if enabled:
+                if not st or st == "Disabled":
+                    bad.append(f"state={st}（已启用任务不应是 Disabled）")
+            elif st != "Disabled":
+                bad.append(f"state={st}（期望 Disabled）")
 
         if not bad:
             SafePrint.success(
