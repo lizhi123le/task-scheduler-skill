@@ -184,6 +184,25 @@ schedule update "任务名称" --name "新任务名称"
 schedule update "任务名称" --daily 04:00 --dry-run
 ```
 
+字段一览：
+
+| 字段 | 参数 | 说明 |
+|------|------|------|
+| 任务名 | `--name` | 重命名；其它任务的依赖引用自动同步 |
+| 命令 | `--cmd` / `--command` | 要执行的命令行（原样存库，经 shell 执行） |
+| 调度 | `--daily` `--weekly` `--monthly` `--hourly` `--interval` `--every-days` `--at-startup` | 七选一，给哪个就整体换成哪种调度 |
+| 状态 | `--status active\|paused` | 等价于 `enable` / `pause` |
+| 分组 | `--group` | 传空字符串表示清空 |
+| 依赖 | `--depends-on` | 传空字符串表示清空 |
+| 工作目录 | `--working-dir` | 传空字符串表示清空 |
+| 环境变量 | `--env KEY=VALUE` / `--clear-env` | 给了 `--env` 就整体替换 |
+| 重试 | `--retry-count` / `--retry-delay` | 次数为 0 表示不重试 |
+| 通知 | `--notify-on-success` / `--notify-on-fail` / `--slack-webhook` / `--email` | slack 或 email |
+| 其它 | `--dry-run` | 只看将改什么，不写库、不动系统任务 |
+
+不可修改：`id` / `created_at` / `last_run` / `run_count` / `fail_count` / `next_run`
+（由系统维护，`next_run` 在修改后自动重算）。
+
 规则：
 
 - **只改传入的字段**，未传的保持原值；字符串字段传空串表示清空（如 `--group ""`）。

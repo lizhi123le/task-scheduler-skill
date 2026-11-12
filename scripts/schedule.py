@@ -2620,49 +2620,94 @@ def main():
 
     # update 命令（就地修改既有任务的任一字段）
     update_parser = subparsers.add_parser(
-        'update', help='修改既有任务（触发时间/命令/分组/依赖/重试/通知等）')
-    update_parser.add_argument('name', help='要修改的任务名称')
-    update_parser.add_argument('--name', dest='new_name', default=_UNSET,
-                               help='重命名任务')
-    update_parser.add_argument('--cmd', '--command', dest='task_command',
-                               default=_UNSET, help='要执行的命令')
-    update_parser.add_argument('--daily', metavar='HH:MM', help='改为每天执行')
-    update_parser.add_argument('--weekly', nargs=2, metavar=('DAY', 'HH:MM'),
-                               help='改为每周执行（如: mon 09:00）')
-    update_parser.add_argument('--monthly', nargs=2, metavar=('DAY', 'HH:MM'),
-                               help='改为每月执行（如: 1 03:00）')
-    update_parser.add_argument('--hourly', action='store_true', help='改为每小时执行')
-    update_parser.add_argument('--interval', metavar='VALUE',
-                               help='改为间隔执行（如: 30m, 4h, 7d）')
-    update_parser.add_argument('--every-days', nargs=2, metavar=('DAYS', 'HH:MM'),
-                               help='改为每隔N天执行（如: 2 12:06）')
-    update_parser.add_argument('--at-startup', action='store_true',
-                               help='改为开机/登录时执行')
-    update_parser.add_argument('--status', choices=['active', 'paused'],
-                               help='启用/暂停（等价于 enable / pause）')
-    update_parser.add_argument('--group', default=_UNSET,
-                               help='分组（传空字符串表示清空）')
-    update_parser.add_argument('--depends-on', dest='depends_on', default=_UNSET,
-                               help='依赖的任务名（传空字符串表示清空）')
-    update_parser.add_argument('--working-dir', dest='working_dir', default=_UNSET,
-                               help='工作目录（传空字符串表示清空）')
-    update_parser.add_argument('--env', action='append',
-                               help='环境变量 KEY=VALUE，可重复；给定时整体替换')
-    update_parser.add_argument('--clear-env', action='store_true',
-                               help='清空该任务的环境变量')
-    update_parser.add_argument('--notify-on-success', dest='notify_on_success',
-                               choices=['slack', 'email'],
-                               help='成功时通知方式')
-    update_parser.add_argument('--notify-on-fail', dest='notify_on_fail',
-                               choices=['slack', 'email'],
-                               help='失败时通知方式')
-    update_parser.add_argument('--slack-webhook', dest='slack_webhook',
-                               default=_UNSET, help='Slack webhook URL')
-    update_parser.add_argument('--email', default=_UNSET, help='通知邮箱')
-    update_parser.add_argument('--retry-count', dest='retry_count', type=int,
-                               default=_UNSET, help='失败重试次数')
-    update_parser.add_argument('--retry-delay', dest='retry_delay', type=int,
-                               default=_UNSET, help='重试间隔秒数')
+        'update',
+        help='修改既有任务（触发时间/命令/分组/依赖/重试/通知等）',
+        description='就地修改既有任务的任一字段：只改传入的字段，未传的保持原值；'
+                    '保留原 id 与执行历史，改完自动重算 next_run 并重建系统计划任务。',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+字段说明:
+  任务名     --name NEW             重命名；其它任务的 --depends-on 引用会自动同步
+  命令       --cmd/--command CMD   要执行的命令行（原样存库，经 shell 执行）
+  调度       以下七选一，给哪个就整体换成哪种调度：
+               --daily HH:MM                 每天
+               --weekly DAY HH:MM            每周（如 mon 09:00）
+               --monthly DAY HH:MM           每月（如 1 03:00）
+               --hourly                      每小时
+               --interval VALUE              间隔（如 30m / 4h / 7d）
+               --every-days N HH:MM          每 N 天（沿用原日期网格，保住相位）
+               --at-startup                  登录时启动（Windows ONLOGON）
+  状态       --status active|paused  等价于 enable / pause
+  分组       --group NAME            传空字符串表示清空
+  依赖       --depends-on NAME       前序任务名；传空字符串表示清空
+  工作目录   --working-dir DIR       传空字符串表示清空
+  环境变量   --env KEY=VALUE         可重复；给了就整体替换原环境变量
+             --clear-env             清空该任务的环境变量
+  重试       --retry-count N         失败重试次数（0 表示不重试）
+             --retry-delay SEC       重试间隔秒数
+  通知       --notify-on-success {slack,email} / --notify-on-fail {slack,email}
+             --slack-webhook URL     Slack webhook
+             --email ADDR            通知邮箱
+  其它       --dry-run               只显示将修改什么，不写库、不动系统任务
+
+不可修改: id / created_at / last_run / run_count / fail_count / next_run
+          （id 与统计字段由系统维护，next_run 在修改后自动重算）
+
+示例:
+  schedule update "整理下载" --daily 03:30
+  schedule update "数据同步" --every-days 3 01:00 --retry-count 5 --retry-delay 300
+  schedule update "任务名" --cmd "python new_job.py" --group "维护任务" --env "ENV=prod"
+  schedule update "任务名" --name "新任务名"
+  schedule update "任务名" --daily 04:00 --dry-run
+        """)
+
+    update_parser.add_argument('name', help='要修改的任务名称（原有任务）')
+
+    sched_group = update_parser.add_argument_group('调度字段（七选一，给哪个就整体换成哪种）')
+    sched_group.add_argument('--daily', metavar='HH:MM', help='改为每天执行，如 18:30')
+    sched_group.add_argument('--weekly', nargs=2, metavar=('DAY', 'HH:MM'),
+                             help='改为每周执行，如 mon 09:00')
+    sched_group.add_argument('--monthly', nargs=2, metavar=('DAY', 'HH:MM'),
+                             help='改为每月执行，如 1 03:00')
+    sched_group.add_argument('--hourly', action='store_true', help='改为每小时执行')
+    sched_group.add_argument('--interval', metavar='VALUE',
+                             help='改为间隔执行，如 30m / 4h / 7d')
+    sched_group.add_argument('--every-days', nargs=2, metavar=('DAYS', 'HH:MM'),
+                             help='改为每隔N天执行，如 3 21:40（沿用原日期网格，保住相位）')
+    sched_group.add_argument('--at-startup', action='store_true',
+                             help='改为开机/登录时执行（Windows ONLOGON）')
+
+    task_group = update_parser.add_argument_group('任务字段')
+    task_group.add_argument('--name', dest='new_name', default=_UNSET,
+                            help='重命名任务（其它任务的依赖引用会自动同步）')
+    task_group.add_argument('--cmd', '--command', dest='task_command', default=_UNSET,
+                            help='要执行的命令行')
+    task_group.add_argument('--status', choices=['active', 'paused'],
+                            help='启用/暂停（等价于 enable / pause）')
+    task_group.add_argument('--group', default=_UNSET,
+                            help='任务分组（传空字符串表示清空）')
+    task_group.add_argument('--depends-on', dest='depends_on', default=_UNSET,
+                            help='依赖的前序任务名（传空字符串表示清空）')
+    task_group.add_argument('--working-dir', dest='working_dir', default=_UNSET,
+                            help='工作目录（传空字符串表示清空）')
+    task_group.add_argument('--env', action='append', metavar='KEY=VALUE',
+                            help='环境变量，可重复；给定时整体替换原环境变量')
+    task_group.add_argument('--clear-env', action='store_true',
+                            help='清空该任务的环境变量')
+
+    notify_group = update_parser.add_argument_group('重试与通知')
+    notify_group.add_argument('--retry-count', dest='retry_count', type=int,
+                              default=_UNSET, help='失败重试次数（0 表示不重试）')
+    notify_group.add_argument('--retry-delay', dest='retry_delay', type=int,
+                              default=_UNSET, help='重试间隔秒数')
+    notify_group.add_argument('--notify-on-success', dest='notify_on_success',
+                              choices=['slack', 'email'], help='成功时的通知方式')
+    notify_group.add_argument('--notify-on-fail', dest='notify_on_fail',
+                              choices=['slack', 'email'], help='失败时的通知方式')
+    notify_group.add_argument('--slack-webhook', dest='slack_webhook', default=_UNSET,
+                              help='Slack webhook URL')
+    notify_group.add_argument('--email', default=_UNSET, help='通知邮箱')
+
     update_parser.add_argument('--dry-run', action='store_true',
                                help='只显示将修改什么，不写库、不动系统任务')
     
