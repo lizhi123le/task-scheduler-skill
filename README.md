@@ -124,6 +124,7 @@ schedule list
 schedule add "任务名" --cmd "命令" --daily 21:00
 schedule update "任务名" --daily 18:30   # 改触发时间/命令/依赖…（保留 id 与历史）
 schedule update "任务名" --repeat 30m --repeat-duration 4h   # 触发器重复间隔
+schedule update "*" --retry-count 0                          # 通配符：批量改所有任务
 schedule update "任务名" --daily 04:00 --dry-run   # 只看改什么
 schedule pause|enable|remove "任务名"
 schedule run-now "任务名"     # 注意：run-now 在本进程内直接执行，不经 Task Scheduler

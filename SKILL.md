@@ -231,6 +231,11 @@ schedule update "任务名称" --name "新任务名称"
 
 # 先看将改什么，不落盘、不动系统任务
 schedule update "任务名称" --daily 04:00 --dry-run
+
+# 任务名支持通配符：* = 所有任务，灵枢* = 按前缀批量
+schedule update "*" --retry-count 0
+schedule update "灵枢*" --retry-delay 120
+schedule update "*" --retry-count 0 --dry-run
 ```
 
 字段一览：
@@ -255,6 +260,8 @@ schedule update "任务名称" --daily 04:00 --dry-run
 
 规则：
 
+- **任务名支持通配符**（`*` / `?` / `[seq]`）：`*` 表示所有任务，`灵枢*` 是前缀匹配；
+  批量时逐条执行、逐条打印，失败的任务会汇总列出并以非 0 退出；先用 `--dry-run` 预演。
 - **只改传入的字段**，未传的保持原值；字符串字段传空串表示清空（如 `--group ""`）。
 - 一次只能给一种调度参数（`--daily` / `--weekly` / `--monthly` / `--hourly` / `--interval` /
   `--every-days` / `--at-startup`）。

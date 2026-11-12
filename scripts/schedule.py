@@ -46,6 +46,7 @@ import threading
 import traceback
 import calendar
 import copy
+import fnmatch
 
 # Windows 编码修复
 if sys.platform == 'win32':
@@ -926,7 +927,7 @@ class TaskScheduler:
             SafePrint.info("[DRY-RUN] 将修改:")
             for line in changes:
                 SafePrint.info(f"  - {line}")
-            if draft.next_run:
+            if draft.next_run and draft.next_run != task.next_run:
                 SafePrint.info(f"  - 下次执行: {draft.next_run[:16]}")
             return True
 
@@ -2470,6 +2471,22 @@ class TaskScheduler:
         SafePrint.info(f"[邮件通知] 任务 '{task.name}' {'成功' if success else '失败'}")
         SafePrint.info(f"收件人: {task.email}")
     
+    def match_task_names(self, pattern: str) -> List[str]:
+        """按名称匹配任务，返回按 id 升序的名称列表。
+
+        支持通配符 `*` / `?` / `[seq]`：`*` 即“所有任务”，也可以写 `灵枢*`、`?dcg*`；
+        没有通配符时按精确名匹配。`update` 用它可以一次改多条任务。
+        """
+        pattern = (pattern or "").strip()
+        wildcard = any(ch in pattern for ch in "*?[")
+        names: List[str] = []
+        for task in sorted(self.tasks, key=lambda t: t.id):
+            matched = (fnmatch.fnmatch(task.name, pattern) if wildcard
+                       else task.name == pattern)
+            if matched:
+                names.append(task.name)
+        return names
+
     def list_tasks(self, group: Optional[str] = None) -> List[Task]:
         """列出所有任务"""
         tasks = self.tasks
@@ -3042,10 +3059,14 @@ def main():
   schedule update "任务名" --name "新任务名"
   schedule update "任务名" --repeat 30m --repeat-duration 4h
   schedule update "任务名" --clear-repeat
+  schedule update "*" --retry-count 0          # 通配符：对所有任务批量修改
+  schedule update "灵枢*" --retry-delay 120    # 也可以按前缀批量改
   schedule update "任务名" --daily 04:00 --dry-run
         """)
 
-    update_parser.add_argument('name', help='要修改的任务名称（原有任务）')
+    update_parser.add_argument('name',
+                               help='要修改的任务名称；支持通配符，`*` 表示所有任务'
+                                    '（如 schedule update "*" --retry-count 0）')
 
     sched_group = update_parser.add_argument_group('调度字段（七选一，给哪个就整体换成哪种）')
     sched_group.add_argument('--daily', metavar='HH:MM', help='改为每天执行，如 18:30')
@@ -3338,7 +3359,26 @@ def main():
             if args.repeat_duration is not _UNSET:
                 kwargs['repeat_duration'] = args.repeat_duration
 
-        if not scheduler.update_task(args.name, dry_run=args.dry_run, **kwargs):
+        # 名称支持通配：`*` = 所有任务，也支持 `灵枢*` / `?` 这类模式
+        targets = scheduler.match_task_names(args.name)
+        if not targets:
+            SafePrint.error(f"没有匹配的任务: {args.name}")
+            sys.exit(1)
+        if len(targets) > 1:
+            SafePrint.info(f"匹配到 {len(targets)} 个任务: {', '.join(targets)}")
+
+        failed: List[str] = []
+        for target in targets:
+            if not scheduler.update_task(target, dry_run=args.dry_run, **kwargs):
+                failed.append(target)
+
+        if len(targets) > 1:
+            if failed:
+                SafePrint.error(f"共 {len(targets)} 个任务，失败 {len(failed)} 个: "
+                                f"{', '.join(failed)}")
+            else:
+                SafePrint.success(f"共 {len(targets)} 个任务已全部处理")
+        if failed:
             sys.exit(1)
     
     elif args.command == 'run-now':
