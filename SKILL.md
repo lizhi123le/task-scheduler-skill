@@ -141,7 +141,59 @@ schedule remove "任务名称"
 schedule run-now "任务名称"
 ```
 
-### 5. 监控与日志（改进）
+### 5. 修改任务（update）
+
+已有任务不必删了重建 —— `update` 直接改任一字段，保留原 id 与执行历史，改完自动重算
+`next_run` 并重建系统计划任务。
+
+```bash
+# 只改触发时间（其余字段一律不动）
+schedule update "任务名称" --daily 18:30
+
+# 换调度类型：每周 / 每月 / 每N天 / 间隔 / 登录启动
+schedule update "任务名称" --weekly mon 09:00
+schedule update "任务名称" --every-days 3 21:40
+schedule update "任务名称" --interval 30m
+schedule update "任务名称" --at-startup
+
+# 改命令、分组、依赖、工作目录
+schedule update "任务名称" \
+  --command "python new_job.py" \
+  --group "维护任务" \
+  --depends-on "数据备份" \
+  --working-dir "D:/work"
+
+# 改重试与通知
+schedule update "任务名称" \
+  --retry-count 5 \
+  --retry-delay 300 \
+  --notify-on-fail slack \
+  --slack-webhook "https://hooks.slack.com/..."
+
+# 改环境变量（给了 --env 就整体替换；--clear-env 清空）
+schedule update "任务名称" --env "API_KEY=xxx" --env "ENV=prod"
+schedule update "任务名称" --clear-env
+
+# 启用 / 暂停（等价于 enable / pause）
+schedule update "任务名称" --status paused
+
+# 重命名（其它任务的 --depends-on 引用会自动同步）
+schedule update "任务名称" --name "新任务名称"
+
+# 先看将改什么，不落盘、不动系统任务
+schedule update "任务名称" --daily 04:00 --dry-run
+```
+
+规则：
+
+- **只改传入的字段**，未传的保持原值；字符串字段传空串表示清空（如 `--group ""`）。
+- 一次只能给一种调度参数（`--daily` / `--weekly` / `--monthly` / `--hourly` / `--interval` /
+  `--every-days` / `--at-startup`）。
+- 任务不存在、改名撞名、命令为空、调度时间非法 → 直接报错，不落库、不动系统任务。
+- `every_days` 改时间时沿用旧 `next_run` 的日期网格，**不会**把「每 3 天」的任务整体挪到今天。
+- 统计字段（`run_count` / `fail_count` / `last_run` / `created_at`）不开放修改；`next_run` 自动重算。
+
+### 6. 监控与日志（改进）
 
 ```bash
 # 查看所有日志（从 SQLite 数据库）
@@ -157,7 +209,7 @@ schedule logs --last 20
 schedule logs --failed
 ```
 
-### 6. 通知设置（增强）
+### 7. 通知设置（增强）
 
 ```bash
 # 任务失败时发送Slack通知
@@ -177,7 +229,7 @@ schedule add "日报生成" \
 # Windows 系统还会显示原生通知气泡
 ```
 
-### 7. 任务组
+### 8. 任务组
 
 ```bash
 # 将任务分组管理
@@ -193,7 +245,7 @@ schedule list --group "维护任务"
 schedule pause --group "维护任务"
 ```
 
-### 8. 环境变量
+### 9. 环境变量
 
 ```bash
 # 为任务设置环境变量
@@ -340,6 +392,7 @@ CREATE TABLE execution_logs (
 | `remove` | 删除任务 | `schedule remove "名称"` |
 | `pause` | 暂停任务 | `schedule pause "名称"` |
 | `enable` | 启用任务 | `schedule enable "名称"` |
+| `update` | 修改任务任一字段（触发时间/命令/分组/依赖/重试/通知/改名） | `schedule update "名称" --daily 18:30` |
 | `run-now` | 立即执行 | `schedule run-now "名称"` |
 | `logs` | 查看日志 | `schedule logs --task "名称"` |
 | `export` | 导出配置 | `schedule export config.json` |

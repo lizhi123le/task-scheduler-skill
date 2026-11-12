@@ -113,6 +113,11 @@ class Task:
     retry_delay: int = 60  # 重试间隔（秒）
 
 
+# 「本次调用没有提供该字段」的哨兵。update_task 用它区分“没传”和“传了空值/None”：
+# 前者保持原值，后者才是真的要清空（例如 --group "" 清掉分组）。
+_UNSET = object()
+
+
 class SafePrint:
     """安全的打印类，处理编码问题"""
     @staticmethod
@@ -736,11 +741,211 @@ class TaskScheduler:
         
         return task
     
-    def _setup_system_scheduler(self, task: Task) -> bool:
-        """设置系统级定时任务"""
+    def update_task(self, name: str, *, new_name=_UNSET, command=_UNSET,
+                    schedule_type=_UNSET, schedule_value=_UNSET, status=_UNSET,
+                    group=_UNSET, depends_on=_UNSET, working_dir=_UNSET,
+                    env_vars=_UNSET, notify_on_success=_UNSET,
+                    notify_on_fail=_UNSET, slack_webhook=_UNSET,
+                    email=_UNSET, retry_count=_UNSET, retry_delay=_UNSET,
+                    dry_run: bool = False) -> bool:
+        """就地修改既有任务（任一字段），改完重建系统计划任务并重算 next_run。
+
+        只动传入的字段，未传的保持原值；`_UNSET` 哨兵用于区分“没传”与“传了空值”。
+        与 remove + add 的区别：保住 id 与 run_count/last_run 历史，系统任务实体名
+        也不漂移（`--name` 改名的除外，那种先删旧实体再建新的）。
+
+        - 换调度（daily → every_days 等）时重算 next_run；every_days 以旧 next_run
+          的日期网格 + 新的 N 天步长递推，保住“每 N 天”的相位，不整体挪到今天。
+        - 暂停的任务改完仍是暂停：实体照建但禁用，库里不留 next_run。
+        - 改名会连带改掉其它任务的 depends_on 引用。
+        """
+        task = next((t for t in self.tasks if t.name == name), None)
+        if task is None:
+            SafePrint.error(f"任务 '{name}' 不存在")
+            return False
+
+        draft = copy.copy(task)          # 全部改动先落在副本上，失败不污染内存
+        changes: List[str] = []
+
+        def _set(field_name: str, label: str, value) -> None:
+            if getattr(draft, field_name) != value:
+                changes.append(f"{label}: {getattr(draft, field_name)} -> {value}")
+                setattr(draft, field_name, value)
+
+        if new_name is not _UNSET:
+            if not isinstance(new_name, str) or not new_name.strip():
+                SafePrint.error("新任务名不能为空")
+                return False
+            new_name = new_name.strip()
+            if new_name != draft.name:
+                if any(t.name == new_name for t in self.tasks):
+                    SafePrint.error(f"任务 '{new_name}' 已存在")
+                    return False
+                _set('name', '名称', new_name)
+
+        if command is not _UNSET:
+            if not isinstance(command, str) or not command.strip():
+                SafePrint.error("命令不能为空")
+                return False
+            _set('command', '命令', command.strip())
+
+        # 可选字符串字段：传空字符串或 None 表示清空
+        for field_name, label, value in (
+                ('group', '分组', group),
+                ('depends_on', '依赖', depends_on),
+                ('working_dir', '工作目录', working_dir),
+                ('notify_on_success', '成功通知', notify_on_success),
+                ('notify_on_fail', '失败通知', notify_on_fail),
+                ('slack_webhook', 'Slack Webhook', slack_webhook),
+                ('email', '通知邮箱', email)):
+            if value is _UNSET:
+                continue
+            _set(field_name, label, (value or '').strip() or None)
+
+        if env_vars is not _UNSET:
+            if not isinstance(env_vars, dict):
+                SafePrint.error("环境变量应为 KEY=VALUE 形式")
+                return False
+            _set('env_vars', '环境变量', {str(k): str(v) for k, v in env_vars.items()})
+
+        for field_name, label, value in (
+                ('retry_count', '重试次数', retry_count),
+                ('retry_delay', '重试间隔(秒)', retry_delay)):
+            if value is _UNSET:
+                continue
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                SafePrint.error(f"{label}必须是整数")
+                return False
+            if number < 0:
+                SafePrint.error(f"{label}不能为负数")
+                return False
+            _set(field_name, label, number)
+
+        if status is not _UNSET:
+            if status not in ('active', 'paused'):
+                SafePrint.error("--status 只能是 active 或 paused")
+                return False
+            _set('status', '状态', status)
+
+        if (schedule_type is _UNSET) != (schedule_value is _UNSET):
+            SafePrint.error("修改调度需要同时给出类型与值")
+            return False
+        if schedule_type is not _UNSET:
+            err = _validate_schedule_value(schedule_type, schedule_value)
+            if err:
+                SafePrint.error(f"调度时间无效: {err}")
+                return False
+            old_desc = format_schedule_str(task)
+            new_desc = format_schedule_str(Task(id=task.id, name=task.name,
+                                                command=task.command,
+                                                schedule_type=schedule_type,
+                                                schedule_value=schedule_value))
+            if (schedule_type, schedule_value) != (task.schedule_type,
+                                                   task.schedule_value):
+                changes.append(f"调度: {old_desc} -> {new_desc}")
+                draft.schedule_type = schedule_type
+                draft.schedule_value = schedule_value
+
+        if not changes:
+            SafePrint.info(f"任务 '{task.name}' 没有需要修改的字段")
+            return True
+
+        # ---- 重算 next_run ----
+        old_next_run = task.next_run
+        schedule_changed = (draft.schedule_type, draft.schedule_value) != (
+            task.schedule_type, task.schedule_value)
+        if draft.status == 'paused':
+            draft.next_run = None
+        elif schedule_changed:
+            if draft.schedule_type == 'every_days' and old_next_run:
+                draft.next_run = self._every_days_next_run(draft, old_next_run)
+            else:
+                draft.next_run = self._calculate_next_run(draft)
+        elif task.status == 'paused':
+            # 从暂停恢复：重新排期，不沿用暂停时被清空的 next_run
+            draft.next_run = self._calculate_next_run(draft)
+
+        if dry_run:
+            SafePrint.info("[DRY-RUN] 将修改:")
+            for line in changes:
+                SafePrint.info(f"  - {line}")
+            if draft.next_run:
+                SafePrint.info(f"  - 下次执行: {draft.next_run[:16]}")
+            return True
+
+        if not self.db.save_task(draft):
+            SafePrint.error("保存修改失败")
+            return False
+
+        # 改名后系统实体名也变了：先删旧实体，再按新名字重建
+        if draft.name != task.name:
+            self._remove_system_scheduler(task)
+
+        anchor = None
+        if (draft.status == 'active' and draft.next_run
+                and draft.schedule_type in ('daily', 'every_days', 'weekly', 'monthly')):
+            try:
+                anchor = datetime.fromisoformat(draft.next_run)
+            except ValueError:
+                anchor = None
+
+        if not self._setup_system_scheduler(draft, anchor=anchor):
+            SafePrint.warn("系统计划任务重建失败，可稍后执行 `schedule repair`")
+
+        # 暂停任务：实体处于禁用态，库里不留 next_run（与 pause_task 语义一致）
+        if draft.status == 'paused':
+            draft.next_run = None
+            self.db.save_task(draft)
+
+        self.tasks[self.tasks.index(task)] = draft
+
+        if draft.name != task.name:
+            for other in self.tasks:
+                if other is not draft and other.depends_on == task.name:
+                    other.depends_on = draft.name
+                    self.db.save_task(other)
+                    SafePrint.info(f"已同步 '{other.name}' 的依赖引用: "
+                                   f"{task.name} -> {draft.name}")
+
+        for line in changes:
+            SafePrint.success(line)
+        SafePrint.success(f"任务 '{draft.name}' 已更新"
+                          + (f"（下次执行 {draft.next_run[:16]}）" if draft.next_run else ""))
+        return True
+
+    def _every_days_next_run(self, task: Task, old_next_run: str) -> Optional[str]:
+        """every_days 改时间时，沿用旧 next_run 的日期网格 + 新调度的时间。
+
+        直接调 _calculate_next_run 会按 created_at 重算网格，相位可能整体挪位
+        （14 天体检之类的任务被挪到明天）。这里以旧 next_run 的日期为锚点，按
+        新的 N 天步长递推到 now 之后。
+        """
+        try:
+            old = datetime.fromisoformat(old_next_run)
+            days_part, time_part = task.schedule_value.split('|')
+            step = timedelta(days=max(1, int(days_part)))
+            hour, minute = map(int, time_part.split(':'))
+        except (TypeError, ValueError):
+            return self._calculate_next_run(task)
+        candidate = old.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        now = datetime.now()
+        while candidate <= now:
+            candidate += step
+        return candidate.isoformat()
+
+    def _setup_system_scheduler(self, task: Task,
+                                anchor: Optional[datetime] = None) -> bool:
+        """设置系统级定时任务
+
+        anchor：仅 Windows 的日历型任务用得上 —— 钉住 StartBoundary 以保住
+        “每 N 天”的相位（update/repair 重建时传入新的下次执行时间）。
+        macOS/Linux 由各自触发器定义，忽略该参数。
+        """
         try:
             if self.platform == Platform.WINDOWS:
-                return self._setup_windows_task(task)
+                return self._setup_windows_task(task, anchor=anchor)
             elif self.platform == Platform.MACOS:
                 return self._setup_macos_task(task)
             else:
@@ -2336,6 +2541,20 @@ def main():
   # 添加带重试的任务
   %(prog)s add "重要任务" --command "job.sh" --daily 12:00 --retry-count 5 --retry-delay 300
   
+  # 修改触发时间（其余字段保持不变）
+  %(prog)s update "整理下载" --daily 03:30
+  
+  # 修改任意字段：命令/分组/依赖/重试/通知/环境变量（未传的字段保持原值）
+  %(prog)s update "数据同步" --command "bash sync_v2.sh" --every-days 3 01:00 \\
+      --group "维护任务" --depends-on "数据备份" --retry-count 5 --retry-delay 300 \\
+      --env "API_KEY=xxx" --notify-on-fail slack --slack-webhook "https://hooks.slack.com/..."
+  
+  # 重命名 / 改名后依赖引用会自动同步
+  %(prog)s update "数据同步" --name "数据同步(新版)"
+  
+  # 先看将改什么，不落盘
+  %(prog)s update "数据同步" --daily 04:00 --dry-run
+  
   # 列出所有任务
   %(prog)s list
   
@@ -2398,6 +2617,54 @@ def main():
     # enable 命令
     enable_parser = subparsers.add_parser('enable', help='启用任务')
     enable_parser.add_argument('name', help='任务名称')
+
+    # update 命令（就地修改既有任务的任一字段）
+    update_parser = subparsers.add_parser(
+        'update', help='修改既有任务（触发时间/命令/分组/依赖/重试/通知等）')
+    update_parser.add_argument('name', help='要修改的任务名称')
+    update_parser.add_argument('--name', dest='new_name', default=_UNSET,
+                               help='重命名任务')
+    update_parser.add_argument('--cmd', '--command', dest='task_command',
+                               default=_UNSET, help='要执行的命令')
+    update_parser.add_argument('--daily', metavar='HH:MM', help='改为每天执行')
+    update_parser.add_argument('--weekly', nargs=2, metavar=('DAY', 'HH:MM'),
+                               help='改为每周执行（如: mon 09:00）')
+    update_parser.add_argument('--monthly', nargs=2, metavar=('DAY', 'HH:MM'),
+                               help='改为每月执行（如: 1 03:00）')
+    update_parser.add_argument('--hourly', action='store_true', help='改为每小时执行')
+    update_parser.add_argument('--interval', metavar='VALUE',
+                               help='改为间隔执行（如: 30m, 4h, 7d）')
+    update_parser.add_argument('--every-days', nargs=2, metavar=('DAYS', 'HH:MM'),
+                               help='改为每隔N天执行（如: 2 12:06）')
+    update_parser.add_argument('--at-startup', action='store_true',
+                               help='改为开机/登录时执行')
+    update_parser.add_argument('--status', choices=['active', 'paused'],
+                               help='启用/暂停（等价于 enable / pause）')
+    update_parser.add_argument('--group', default=_UNSET,
+                               help='分组（传空字符串表示清空）')
+    update_parser.add_argument('--depends-on', dest='depends_on', default=_UNSET,
+                               help='依赖的任务名（传空字符串表示清空）')
+    update_parser.add_argument('--working-dir', dest='working_dir', default=_UNSET,
+                               help='工作目录（传空字符串表示清空）')
+    update_parser.add_argument('--env', action='append',
+                               help='环境变量 KEY=VALUE，可重复；给定时整体替换')
+    update_parser.add_argument('--clear-env', action='store_true',
+                               help='清空该任务的环境变量')
+    update_parser.add_argument('--notify-on-success', dest='notify_on_success',
+                               choices=['slack', 'email'],
+                               help='成功时通知方式')
+    update_parser.add_argument('--notify-on-fail', dest='notify_on_fail',
+                               choices=['slack', 'email'],
+                               help='失败时通知方式')
+    update_parser.add_argument('--slack-webhook', dest='slack_webhook',
+                               default=_UNSET, help='Slack webhook URL')
+    update_parser.add_argument('--email', default=_UNSET, help='通知邮箱')
+    update_parser.add_argument('--retry-count', dest='retry_count', type=int,
+                               default=_UNSET, help='失败重试次数')
+    update_parser.add_argument('--retry-delay', dest='retry_delay', type=int,
+                               default=_UNSET, help='重试间隔秒数')
+    update_parser.add_argument('--dry-run', action='store_true',
+                               help='只显示将修改什么，不写库、不动系统任务')
     
     # run-now 命令
     run_parser = subparsers.add_parser('run-now', help='立即执行任务')
@@ -2559,6 +2826,68 @@ def main():
     elif args.command == 'enable':
         if scheduler.enable_task(args.name):
             SafePrint.success(f"任务 '{args.name}' 已启用")
+
+    elif args.command == 'update':
+        # 调度参数：最多给一种，给了就整体换调度（类型 + 值必须成对）
+        picked: List[tuple] = []
+        if args.at_startup:
+            picked.append(('startup', 'onlogon'))
+        if args.daily:
+            picked.append(('daily', args.daily))
+        if args.weekly:
+            picked.append(('weekly', f"{args.weekly[0]} {args.weekly[1]}"))
+        if args.monthly:
+            picked.append(('monthly', f"{args.monthly[0]} {args.monthly[1]}"))
+        if args.hourly:
+            picked.append(('hourly', '0'))
+        if args.interval:
+            picked.append(('interval', args.interval))
+        if args.every_days:
+            picked.append(('every_days', f"{args.every_days[0]}|{args.every_days[1]}"))
+        if len(picked) > 1:
+            SafePrint.error("一次只能指定一种调度：--at-startup / --daily / --weekly / "
+                            "--monthly / --hourly / --interval / --every-days")
+            sys.exit(1)
+
+        kwargs: Dict[str, Any] = {}
+        if picked:
+            kwargs['schedule_type'], kwargs['schedule_value'] = picked[0]
+
+        if args.new_name is not _UNSET:
+            kwargs['new_name'] = args.new_name
+        if args.task_command is not _UNSET:
+            kwargs['command'] = args.task_command
+        if args.status:
+            kwargs['status'] = args.status
+        for arg_name, field_name in (
+                ('group', 'group'), ('depends_on', 'depends_on'),
+                ('working_dir', 'working_dir'),
+                ('notify_on_success', 'notify_on_success'),
+                ('notify_on_fail', 'notify_on_fail'),
+                ('slack_webhook', 'slack_webhook'), ('email', 'email')):
+            value = getattr(args, arg_name)
+            if value is not _UNSET:
+                kwargs[field_name] = value
+
+        if args.env:
+            env_vars = {}
+            for item in args.env:
+                if '=' not in item:
+                    SafePrint.error(f"环境变量格式应为 KEY=VALUE: {item}")
+                    sys.exit(1)
+                key, value = item.split('=', 1)
+                env_vars[key] = value
+            kwargs['env_vars'] = env_vars
+        elif args.clear_env:
+            kwargs['env_vars'] = {}
+
+        if args.retry_count is not _UNSET:
+            kwargs['retry_count'] = args.retry_count
+        if args.retry_delay is not _UNSET:
+            kwargs['retry_delay'] = args.retry_delay
+
+        if not scheduler.update_task(args.name, dry_run=args.dry_run, **kwargs):
+            sys.exit(1)
     
     elif args.command == 'run-now':
         scheduler.run_task_now(args.name)
