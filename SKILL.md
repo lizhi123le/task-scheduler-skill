@@ -136,7 +136,37 @@ schedule add "网络任务" \
 > （`Access is denied`），此时要在管理员 PowerShell 里执行 `schedule repair` 或
 > `schedule update <任务名> --retry-count N --retry-delay S` 才能重写这组设置。
 
-### 4. 任务管理
+### 4. 触发器重复（--repeat）
+
+不用改基准调度，就能让任务在触发后的时间窗里反复执行（任务计划程序 → 触发器 →「重复任务间隔」）：
+
+```bash
+# 每天 09:00 起，每 30 分钟跑一次，持续 4 小时（09:00~13:00）
+schedule add "高频检查" \
+  --command "check.py" \
+  --daily 09:00 \
+  --repeat 30m \
+  --repeat-duration 4h
+
+# 只改重复间隔（持续时间保持不变）
+schedule update "高频检查" --repeat 45m
+
+# 不给持续时间 = 无限期重复
+schedule update "高频检查" --repeat 2h
+
+# 关闭重复
+schedule update "高频检查" --clear-repeat
+```
+
+- `--repeat` 支持 `Nm` / `Nh` / `Nd`，**最小 1 分钟**（Windows 限制），上限 31 天
+- `--repeat-duration` 给 `4h` 这类值就是持续时长；不给表示「无限期」（系统任务里不写 Duration）
+- 持续时间必须 ≥ 重复间隔，否则直接报错不落库
+- 写入系统任务的 `<Repetition>`（并置 `StopAtDurationEnd=false`，不会掐掉正在跑的那一次）；
+  `add`/`update` 都会回读校验（日志里是 `REP=PT30M/PT4H`，无限期是 `REP=PT2H/`）
+- `schedule list` 仍显示基准调度；重复配置在 `update` 的回读快照里（`重复=每30m，持续4h`）
+- 暂停的任务也保留重复配置，只是系统实体处于 Disabled
+
+### 5. 任务管理
 
 ```bash
 # 列出所有任务
@@ -155,7 +185,7 @@ schedule remove "任务名称"
 schedule run-now "任务名称"
 ```
 
-### 5. 修改任务（update）
+### 6. 修改任务（update）
 
 已有任务不必删了重建 —— `update` 直接改任一字段，保留原 id 与执行历史，改完自动重算
 `next_run` 并重建系统计划任务。
@@ -191,6 +221,10 @@ schedule update "任务名称" --clear-env
 # 启用 / 暂停（等价于 enable / pause）
 schedule update "任务名称" --status paused
 
+# 触发器重复：每 30 分钟一次，持续 4 小时；--clear-repeat 关闭
+schedule update "任务名称" --repeat 30m --repeat-duration 4h
+schedule update "任务名称" --clear-repeat
+
 # 重命名（其它任务的 --depends-on 引用会自动同步）
 schedule update "任务名称" --name "新任务名称"
 
@@ -206,6 +240,7 @@ schedule update "任务名称" --daily 04:00 --dry-run
 | 命令 | `--cmd` / `--command` | 要执行的命令行（原样存库，经 shell 执行） |
 | 调度 | `--daily` `--weekly` `--monthly` `--hourly` `--interval` `--every-days` `--at-startup` | 七选一，给哪个就整体换成哪种调度 |
 | 状态 | `--status active\|paused` | 等价于 `enable` / `pause` |
+| 重复 | `--repeat` / `--repeat-duration` / `--clear-repeat` | 触发器重复间隔（`30m`/`2h`/`1d`，最小 1 分钟），持续时间不给=无限期 |
 | 分组 | `--group` | 传空字符串表示清空 |
 | 依赖 | `--depends-on` | 传空字符串表示清空 |
 | 工作目录 | `--working-dir` | 传空字符串表示清空 |
@@ -229,7 +264,7 @@ schedule update "任务名称" --daily 04:00 --dry-run
 - 暂停的任务改完仍保持暂停：系统实体是 Disabled，库里不留 `next_run`。
 - 统计字段（`run_count` / `fail_count` / `last_run` / `created_at`）不开放修改；`next_run` 自动重算。
 
-### 6. 监控与日志（改进）
+### 7. 监控与日志（改进）
 
 ```bash
 # 查看所有日志（从 SQLite 数据库）
@@ -245,7 +280,7 @@ schedule logs --last 20
 schedule logs --failed
 ```
 
-### 7. 通知设置（增强）
+### 8. 通知设置（增强）
 
 ```bash
 # 任务失败时发送Slack通知
@@ -265,7 +300,7 @@ schedule add "日报生成" \
 # Windows 系统还会显示原生通知气泡
 ```
 
-### 8. 任务组
+### 9. 任务组
 
 ```bash
 # 将任务分组管理
@@ -281,7 +316,7 @@ schedule list --group "维护任务"
 schedule pause --group "维护任务"
 ```
 
-### 9. 环境变量
+### 10. 环境变量
 
 ```bash
 # 为任务设置环境变量

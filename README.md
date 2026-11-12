@@ -93,6 +93,17 @@ active 生效，重建路径也会清空）。
 注意：如果任务实体由**更高权限**上下文创建，普通进程改不动也删不掉（`Access is denied`），
 需在管理员 PowerShell 里跑 `schedule repair` 重写这组设置。
 
+### 9. 触发器重复间隔没地方设
+
+`schtasks /Create` 没有「重复间隔」参数，技能原先只有基准调度（每天 09:00 之类），
+想在时间窗里反复跑只能自己起循环。
+
+修法：给 Task 加 `repeat_interval` / `repeat_duration`（`30m`/`2h`/`1d`），建完任务后改触发器：
+用 `New-ScheduledTaskTrigger` 生成 `Repetition` 模板塞进现有触发器，一次
+`Set-ScheduledTask -Trigger ... -Settings ...` 同时落重复与设置，并回读校验
+（VERIFY 里是 `REP=PT30M/PT4H`，无限期是 `REP=PT2H/`）。`--repeat` 最小 1 分钟、
+上限 31 天，持续时间不得小于间隔；`--clear-repeat` 关闭；旧库自动 `ALTER TABLE` 补两列。
+
 ## 目录
 
 ```
@@ -111,6 +122,7 @@ examples/                    示例任务与脚本
 schedule list
 schedule add "任务名" --cmd "命令" --daily 21:00
 schedule update "任务名" --daily 18:30   # 改触发时间/命令/依赖…（保留 id 与历史）
+schedule update "任务名" --repeat 30m --repeat-duration 4h   # 触发器重复间隔
 schedule update "任务名" --daily 04:00 --dry-run   # 只看改什么
 schedule pause|enable|remove "任务名"
 schedule run-now "任务名"     # 注意：run-now 在本进程内直接执行，不经 Task Scheduler

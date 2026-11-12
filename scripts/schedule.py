@@ -111,6 +111,10 @@ class Task:
     email: Optional[str] = None
     retry_count: int = 3  # 失败重试次数
     retry_delay: int = 60  # 重试间隔（秒）
+    # 触发器重复：repeat_interval 形如 "30m"/"2h"，为空表示不重复；
+    # repeat_duration 为空表示「无限期」持续（Windows 上不写 Duration）。
+    repeat_interval: Optional[str] = None
+    repeat_duration: Optional[str] = None
 
 
 # 「本次调用没有提供该字段」的哨兵。update_task 用它区分“没传”和“传了空值/None”：
@@ -296,9 +300,18 @@ class DatabaseManager:
                     slack_webhook TEXT,
                     email TEXT,
                     retry_count INTEGER DEFAULT 3,
-                    retry_delay INTEGER DEFAULT 60
+                    retry_delay INTEGER DEFAULT 60,
+                    repeat_interval TEXT,
+                    repeat_duration TEXT
                 )
             ''')
+            
+            # 旧库补列（v2.0 早期建的表没有重复触发字段）：
+            # SQLite 不支持 ADD COLUMN IF NOT EXISTS，用 PRAGMA 查一遍再补。
+            existing = {row[1] for row in cursor.execute('PRAGMA table_info(tasks)')}
+            for column in ('repeat_interval', 'repeat_duration'):
+                if column not in existing:
+                    cursor.execute(f'ALTER TABLE tasks ADD COLUMN {column} TEXT')
             
             # 执行日志表
             cursor.execute('''
@@ -329,8 +342,9 @@ class DatabaseManager:
                         status, created_at, last_run, next_run, run_count,
                         fail_count, group_name, depends_on, working_dir,
                         env_vars, notify_on_success, notify_on_fail,
-                        slack_webhook, email, retry_count, retry_delay
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        slack_webhook, email, retry_count, retry_delay,
+                        repeat_interval, repeat_duration
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     task.id, task.name, task.command, task.schedule_type,
                     task.schedule_value, task.status, task.created_at,
@@ -339,7 +353,7 @@ class DatabaseManager:
                     task.working_dir, json.dumps(task.env_vars),
                     task.notify_on_success, task.notify_on_fail,
                     task.slack_webhook, task.email, task.retry_count,
-                    task.retry_delay
+                    task.retry_delay, task.repeat_interval, task.repeat_duration
                 ))
                 conn.commit()
                 return True
@@ -378,7 +392,9 @@ class DatabaseManager:
                         slack_webhook=row[17],
                         email=row[18],
                         retry_count=row[19] or 3,
-                        retry_delay=row[20] or 60
+                        retry_delay=row[20] or 60,
+                        repeat_interval=row[21] if len(row) > 21 else None,
+                        repeat_duration=row[22] if len(row) > 22 else None
                     )
                     tasks.append(task)
         except Exception as e:
@@ -721,6 +737,18 @@ class TaskScheduler:
         if any(task.name == name for task in self.tasks):
             SafePrint.error(f"任务 '{name}' 已存在")
             return None
+
+        # 触发器重复（可选）：格式 30m / 2h / 1d
+        interval = kwargs.get('repeat_interval')
+        duration = kwargs.get('repeat_duration')
+        interval = str(interval).strip().lower() or None if interval else None
+        duration = str(duration).strip().lower() or None if duration else None
+        err = _validate_repeat(interval, duration)
+        if err:
+            SafePrint.error(err)
+            return None
+        kwargs['repeat_interval'] = interval
+        kwargs['repeat_duration'] = duration if interval else None
         
         task = Task(
             id=self._get_next_id(),
@@ -753,6 +781,7 @@ class TaskScheduler:
                     env_vars=_UNSET, notify_on_success=_UNSET,
                     notify_on_fail=_UNSET, slack_webhook=_UNSET,
                     email=_UNSET, retry_count=_UNSET, retry_delay=_UNSET,
+                    repeat_interval=_UNSET, repeat_duration=_UNSET,
                     dry_run: bool = False) -> bool:
         """就地修改既有任务（任一字段），改完重建系统计划任务并重算 next_run。
 
@@ -828,6 +857,26 @@ class TaskScheduler:
                 SafePrint.error(f"{label}不能为负数")
                 return False
             _set(field_name, label, number)
+
+        # 触发器重复：间隔/持续时间成对处理，清掉间隔就一并清掉持续时间
+        if repeat_interval is not _UNSET or repeat_duration is not _UNSET:
+            def _norm_repeat(value, current):
+                if value is _UNSET:
+                    return current
+                if value is None:
+                    return None
+                return str(value).strip().lower() or None
+
+            new_interval = _norm_repeat(repeat_interval, task.repeat_interval)
+            new_duration = _norm_repeat(repeat_duration, task.repeat_duration)
+            if not new_interval:
+                new_interval, new_duration = None, None
+            err = _validate_repeat(new_interval, new_duration)
+            if err:
+                SafePrint.error(err)
+                return False
+            _set('repeat_interval', '重复间隔', new_interval)
+            _set('repeat_duration', '重复持续时间', new_duration)
 
         if status is not _UNSET:
             if status not in ('active', 'paused'):
@@ -1073,17 +1122,18 @@ class TaskScheduler:
 
     @staticmethod
     def _iso_duration_seconds(value: str) -> Optional[int]:
-        """把 Task Scheduler 的 ISO8601 时长（PT10M / PT1H30M / PT30S）解析成秒。
+        """把 Task Scheduler 的 ISO8601 时长（PT10M / PT1H30M / P1D / P1DT2H）解析成秒。
 
         解析不出来返回 None（校验时按“不符合”处理）。
         """
         if not value:
             return None
-        m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", value.strip())
-        if not m or not any(m.groups()):
+        m = re.fullmatch(
+            r"P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?", value.strip())
+        if not m or not any(g is not None for g in m.groups()):
             return None
-        hours, minutes, seconds = (int(x) if x else 0 for x in m.groups())
-        return hours * 3600 + minutes * 60 + seconds
+        days, hours, minutes, seconds = (int(x) if x else 0 for x in m.groups())
+        return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
     def _windows_restart_plan(self, task: Task) -> Tuple[int, int]:
         """任务在 Windows 侧的失败重启策略：(次数, 间隔秒)。
@@ -1132,14 +1182,37 @@ class TaskScheduler:
 
         safe_name = task_name.replace("'", "''")
         state_cmd = 'Enable-ScheduledTask' if enabled else 'Disable-ScheduledTask'
+
+        # 触发器的「重复间隔 / 持续时间」：schtasks /Create 没有对应参数，只能在建好后
+        # 改触发器。这里借 New-ScheduledTaskTrigger 生成 Repetition 模板再塞给现有触发器，
+        # 一次 Set-ScheduledTask 同时落设置与触发器。
+        rep_interval = _repeat_spec_seconds(task.repeat_interval)
+        rep_duration = _repeat_spec_seconds(task.repeat_duration) if rep_interval else None
+        if rep_interval:
+            rep_ps = (
+                "$tmpl = New-ScheduledTaskTrigger -Once -At (Get-Date) "
+                f"-RepetitionInterval (New-TimeSpan -Seconds {rep_interval})"
+                + (f" -RepetitionDuration (New-TimeSpan -Seconds {rep_duration})"
+                   if rep_duration else "")
+                + ";"
+                "$tr.Repetition = $tmpl.Repetition;"
+                # 持续时间到了不要顺手掐掉正在跑的那一次
+                "$tr.Repetition.StopAtDurationEnd = $false;"
+            )
+        else:
+            rep_ps = "$tr.Repetition = $null;"
+
         ps_script = (
             "$ErrorActionPreference='Stop';"
             "$name = '" + safe_name + "';"
+            "$t = Get-ScheduledTask -TaskName $name;"
+            "$tr = $t.Triggers[0];"
+            + rep_ps +
             "$s = New-ScheduledTaskSettingsSet "
             "-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable "
             "-MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 72)"
             + restart_arg + ";"
-            "Set-ScheduledTask -TaskName $name -Settings $s | Out-Null;"
+            "Set-ScheduledTask -TaskName $name -Trigger $tr -Settings $s | Out-Null;"
             f"{state_cmd} -TaskName $name | Out-Null;"
             # 回读校验：命令返回 0 只说明调用没报错，不等于设置真的落盘。
             # 这里把实际生效值读回来，失败即判为未生效，避免"任务已建但设置没应用"。
@@ -1148,11 +1221,15 @@ class TaskScheduler:
             "$r = $x.Task.Settings.RestartOnFailure;"
             "$rst = 'none';"
             "if ($r -and $r.Interval) { $rst = [string]$r.Interval + '/' + [string]$r.Count };"
+            "$tg = @($x.Task.Triggers.ChildNodes) | Where-Object { $_.NodeType -eq 'Element' } | Select-Object -First 1;"
+            "$rp = $tg.Repetition;"
+            "$rep = 'none';"
+            "if ($rp -and $rp.Interval) { $rep = [string]$rp.Interval + '/' + [string]$rp.Duration };"
             "$want = 'DIB=' + [string]$x.Task.Settings.DisallowStartIfOnBatteries + "
             "' SIB=' + [string]$x.Task.Settings.StopIfGoingOnBatteries + "
             "' SWA=' + [string]$x.Task.Settings.StartWhenAvailable + "
             "' MIP=' + [string]$x.Task.Settings.MultipleInstancesPolicy + "
-            "' RST=' + $rst;"
+            "' RST=' + $rst + ' REP=' + $rep;"
             "'VERIFY state=' + [string]$t.State + ' ' + $want"
         )
         try:
@@ -1195,6 +1272,21 @@ class TaskScheduler:
                         f"失败重启 {rst} != {restart_seconds}/{restart_count}")
             elif got_count not in ("", "0"):
                 bad.append(f"失败重启 {rst}（期望关闭）")
+            # 触发器重复：间隔/持续时间都要和库里一致（空 duration = 无限期）
+            rep = parts.get("REP") or "none"
+            got_rep_interval, _, got_rep_duration = rep.partition("/")
+            if rep_interval:
+                if self._iso_duration_seconds(got_rep_interval) != rep_interval:
+                    bad.append(f"重复间隔 {rep or '未设置'} != "
+                               f"{_seconds_to_iso_duration(rep_interval)}")
+                elif rep_duration:
+                    if self._iso_duration_seconds(got_rep_duration) != rep_duration:
+                        bad.append(f"重复持续时间 {rep or '未设置'} != "
+                                   f"{_seconds_to_iso_duration(rep_duration)}")
+                elif got_rep_duration:
+                    bad.append(f"重复持续时间 {got_rep_duration}（DB 期望无限期）")
+            elif got_rep_interval not in ("", "none"):
+                bad.append(f"重复 {rep}（期望关闭）")
             # 状态校验：Enable/Disable 的意图是「别把状态弄反」，而不是「必须在跑」。
             # ⚠️ 已启用但当前空闲的 ScheduledTask，其 State 是 `Ready`
             # （只有正在执行的那几秒才是 `Running`）。此前把期望硬写成 `Running`，
@@ -1284,6 +1376,17 @@ class TaskScheduler:
             m = re.search(pattern, restart_xml)
             return m.group(1) if m else ""
 
+        # 触发器重复：只在 <Triggers> 里找（<Interval> 在 <Repetition> 与
+        # <RestartOnFailure> 里都有，必须限定作用域）
+        triggers_block = re.search(r"<Triggers>(.*?)</Triggers>", xml, re.S)
+        triggers_xml = triggers_block.group(1) if triggers_block else ""
+        repetition = re.search(r"<Repetition>(.*?)</Repetition>", triggers_xml, re.S)
+        repetition_xml = repetition.group(1) if repetition else ""
+
+        def grab_repetition(pattern: str) -> str:
+            m = re.search(pattern, repetition_xml)
+            return m.group(1) if m else ""
+
         return {
             "command": grab(r"<Command>([^<]*)</Command>"),
             "arguments": grab(r"<Arguments>([^<]*)</Arguments>"),
@@ -1295,6 +1398,8 @@ class TaskScheduler:
             "mip": grab(r"<MultipleInstancesPolicy>([^<]*)</MultipleInstancesPolicy>"),
             "restart_interval": grab_restart(r"<Interval>([^<]*)</Interval>"),
             "restart_count": grab_restart(r"<Count>(\d+)</Count>"),
+            "repeat_interval": grab_repetition(r"<Interval>([^<]*)</Interval>"),
+            "repeat_duration": grab_repetition(r"<Duration>([^<]*)</Duration>"),
         }
 
     def _query_windows_state(self, task_name: str) -> str:
@@ -1424,6 +1529,25 @@ class TaskScheduler:
         elif got_count not in ("", "0"):
             fix.append(f"失败重启 {got_interval or '?'}/{got_count} != 关闭")
 
+        # 触发器重复间隔 / 持续时间（空 duration 表示无限期）
+        want_repeat = _repeat_spec_seconds(task.repeat_interval)
+        want_repeat_duration = (_repeat_spec_seconds(task.repeat_duration)
+                                if want_repeat else None)
+        got_repeat = info.get("repeat_interval") or ""
+        got_repeat_duration = info.get("repeat_duration") or ""
+        if want_repeat:
+            if self._iso_duration_seconds(got_repeat) != want_repeat:
+                fix.append(f"重复间隔 {got_repeat or '未设置'} != "
+                           f"{_seconds_to_iso_duration(want_repeat)}")
+            elif want_repeat_duration:
+                if self._iso_duration_seconds(got_repeat_duration) != want_repeat_duration:
+                    fix.append(f"重复持续时间 {got_repeat_duration or '未设置'} != "
+                               f"{_seconds_to_iso_duration(want_repeat_duration)}")
+            elif got_repeat_duration:
+                fix.append(f"重复持续时间 {got_repeat_duration} != 无限期")
+        elif got_repeat:
+            fix.append(f"重复间隔 {got_repeat} != 关闭")
+
         if state:
             if task.status == "active" and state == "Disabled":
                 fix.append("系统里是 Disabled，但库里是 active")
@@ -1480,9 +1604,13 @@ class TaskScheduler:
         state = self._query_windows_state(tname) or "?"
         restart_count, restart_seconds = self._windows_restart_plan(task)
         restart = (f"{restart_seconds}秒x{restart_count}" if restart_count else "关闭")
+        repeat = "关闭"
+        if _repeat_spec_seconds(task.repeat_interval):
+            repeat = f"每{task.repeat_interval}"
+            repeat += (f"，持续{task.repeat_duration}" if task.repeat_duration else "，无限期")
         return (f"{tname} | 触发={info.get('start_boundary') or '?'} "
                 f"| 间隔={info.get('days_interval') or '-'}天 | 状态={state} "
-                f"| 失败重启={restart}")
+                f"| 失败重启={restart} | 重复={repeat}")
 
     def _windows_orphan_ids(self) -> List[int]:
         """系统里存在、数据库里已经没有的 TaskScheduler-<id>-* 的 id。
@@ -2462,6 +2590,19 @@ class TaskScheduler:
             if kwargs.get(key) is not None and not isinstance(kwargs[key], str):
                 kwargs[key] = None
 
+        # 触发器重复（老导出里没有这两个字段，空即不重复）
+        rep_interval = kwargs.get('repeat_interval')
+        rep_duration = kwargs.get('repeat_duration')
+        rep_interval = str(rep_interval).strip().lower() or None if rep_interval else None
+        rep_duration = str(rep_duration).strip().lower() or None if rep_duration else None
+        if not rep_interval:
+            rep_duration = None
+        err = _validate_repeat(rep_interval, rep_duration)
+        if err:
+            raise ValueError(err)
+        kwargs['repeat_interval'] = rep_interval
+        kwargs['repeat_duration'] = rep_duration
+
         # next_run 不照搬：暂停的任务没有触发计划，启用的任务按本机时钟重算
         kwargs.pop('next_run', None)
         return kwargs
@@ -2636,6 +2777,65 @@ def print_tasks_table(tasks: List[Task]):
     SafePrint.print(f"\n总计: {len(tasks)} 个任务\n")
 
 
+_REPEAT_SPEC_RE = re.compile(r"^(\d+)\s*([mhd])$", re.IGNORECASE)
+_REPEAT_UNIT_SECONDS = {"m": 60, "h": 3600, "d": 86400}
+_REPEAT_MAX_SECONDS = 31 * 86400  # Windows 侧 Repetition 的上限是 31 天
+
+
+def _repeat_spec_seconds(value: Optional[str]) -> Optional[int]:
+    """把 '30m' / '2h' / '1d' 解析成秒；空值或格式不对返回 None。"""
+    if not value:
+        return None
+    m = _REPEAT_SPEC_RE.match(str(value).strip())
+    if not m:
+        return None
+    return int(m.group(1)) * _REPEAT_UNIT_SECONDS[m.group(2).lower()]
+
+
+def _seconds_to_iso_duration(seconds: int) -> str:
+    """秒 -> Task Scheduler 的 ISO8601 时长（PT30M / PT2H / PT1H30M / P1D）。"""
+    days, rem = divmod(int(seconds), 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    if days and not (hours or minutes or secs):
+        return f"P{days}D"
+    out = "PT"
+    if days:
+        out = f"P{days}DT"
+    if hours:
+        out += f"{hours}H"
+    if minutes:
+        out += f"{minutes}M"
+    if secs:
+        out += f"{secs}S"
+    return out
+
+
+def _validate_repeat(interval: Optional[str],
+                     duration: Optional[str]) -> Optional[str]:
+    """校验触发器的重复间隔/持续时间，返回错误信息（无错误返回 None）。"""
+    if not interval:
+        if duration:
+            return "设置了重复持续时间但没有重复间隔（--repeat）"
+        return None
+    secs = _repeat_spec_seconds(interval)
+    if not secs:
+        return f"无效重复间隔 '{interval}'，格式如 30m / 2h / 1d"
+    if secs < 60:
+        return f"重复间隔太短（{interval}），Windows 侧最小 1 分钟"
+    if secs > _REPEAT_MAX_SECONDS:
+        return f"重复间隔太大（{interval}），Windows 侧上限 31 天"
+    if duration:
+        dsecs = _repeat_spec_seconds(duration)
+        if not dsecs:
+            return f"无效重复持续时间 '{duration}'，格式如 2h / 1d"
+        if dsecs < secs:
+            return f"重复持续时间（{duration}）不能小于重复间隔（{interval}）"
+        if dsecs > _REPEAT_MAX_SECONDS:
+            return f"重复持续时间太大（{duration}），Windows 侧上限 31 天"
+    return None
+
+
 def _validate_schedule_value(schedule_type: str, schedule_value: str) -> Optional[str]:
     """校验调度时间格式，返回错误信息（无错误返回 None）"""
     try:
@@ -2726,6 +2926,9 @@ def main():
   # 先看将改什么，不落盘
   %(prog)s update "数据同步" --daily 04:00 --dry-run
   
+  # 触发器重复：每 30 分钟跑一次（不给 --repeat-duration 表示无限期）
+  %(prog)s add "高频检查" --command "check.py" --daily 09:00 --repeat 30m --repeat-duration 4h
+  
   # 列出所有任务
   %(prog)s list
   
@@ -2769,6 +2972,10 @@ def main():
                            help='失败重试次数（默认3；同时写入任务计划程序的失败重启策略）')
     add_parser.add_argument('--retry-delay', type=int, default=60,
                            help='重试间隔秒数（默认60；Windows 侧最小 1 分钟）')
+    add_parser.add_argument('--repeat', dest='repeat_interval', metavar='INTERVAL',
+                           help='触发器重复间隔（如 30m / 2h / 1d，Windows 侧最小 1 分钟）')
+    add_parser.add_argument('--repeat-duration', dest='repeat_duration', metavar='DURATION',
+                           help='重复持续时间（如 4h / 1d；不给表示无限期）')
     
     # list 命令
     list_parser = subparsers.add_parser('list', help='列出所有任务')
@@ -2808,6 +3015,9 @@ def main():
                --interval VALUE              间隔（如 30m / 4h / 7d）
                --every-days N HH:MM          每 N 天（沿用原日期网格，保住相位）
                --at-startup                  登录时启动（Windows ONLOGON）
+  重复       --repeat INTERVAL        触发器重复间隔（如 30m / 2h / 1d），空串=关闭
+             --repeat-duration DUR    重复持续时间（如 4h / 1d；不给=无限期）
+             --clear-repeat           关闭重复
   状态       --status active|paused  等价于 enable / pause
   分组       --group NAME            传空字符串表示清空
   依赖       --depends-on NAME       前序任务名；传空字符串表示清空
@@ -2829,6 +3039,8 @@ def main():
   schedule update "数据同步" --every-days 3 01:00 --retry-count 5 --retry-delay 300
   schedule update "任务名" --cmd "python new_job.py" --group "维护任务" --env "ENV=prod"
   schedule update "任务名" --name "新任务名"
+  schedule update "任务名" --repeat 30m --repeat-duration 4h
+  schedule update "任务名" --clear-repeat
   schedule update "任务名" --daily 04:00 --dry-run
         """)
 
@@ -2847,6 +3059,14 @@ def main():
                              help='改为每隔N天执行，如 3 21:40（沿用原日期网格，保住相位）')
     sched_group.add_argument('--at-startup', action='store_true',
                              help='改为开机/登录时执行（Windows ONLOGON）')
+    sched_group.add_argument('--repeat', dest='repeat_interval', metavar='INTERVAL',
+                             default=_UNSET,
+                             help='触发器重复间隔（如 30m / 2h；传空字符串表示关闭）')
+    sched_group.add_argument('--repeat-duration', dest='repeat_duration',
+                             metavar='DURATION', default=_UNSET,
+                             help='重复持续时间（如 4h / 1d；不给表示无限期）')
+    sched_group.add_argument('--clear-repeat', action='store_true',
+                             help='关闭触发器的重复')
 
     task_group = update_parser.add_argument_group('任务字段')
     task_group.add_argument('--name', dest='new_name', default=_UNSET,
@@ -3001,7 +3221,9 @@ def main():
             slack_webhook=args.slack_webhook,
             email=args.email,
             retry_count=args.retry_count,
-            retry_delay=args.retry_delay
+            retry_delay=args.retry_delay,
+            repeat_interval=args.repeat_interval,
+            repeat_duration=args.repeat_duration
         )
         
         if task:
@@ -3015,6 +3237,10 @@ def main():
                 SafePrint.print(f"   依赖: {task.depends_on}")
             if task.retry_count > 0:
                 SafePrint.print(f"   重试: {task.retry_count}次，间隔{task.retry_delay}秒")
+            if task.repeat_interval:
+                SafePrint.print(f"   重复: 每{task.repeat_interval}"
+                                + (f"，持续{task.repeat_duration}" if task.repeat_duration
+                                   else "，无限期"))
     
     elif args.command == 'list':
         tasks = scheduler.list_tasks(group=args.group)
@@ -3101,6 +3327,15 @@ def main():
             kwargs['retry_count'] = args.retry_count
         if args.retry_delay is not _UNSET:
             kwargs['retry_delay'] = args.retry_delay
+
+        if args.clear_repeat:
+            kwargs['repeat_interval'] = None
+            kwargs['repeat_duration'] = None
+        else:
+            if args.repeat_interval is not _UNSET:
+                kwargs['repeat_interval'] = args.repeat_interval
+            if args.repeat_duration is not _UNSET:
+                kwargs['repeat_duration'] = args.repeat_duration
 
         if not scheduler.update_task(args.name, dry_run=args.dry_run, **kwargs):
             sys.exit(1)
