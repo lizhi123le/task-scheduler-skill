@@ -158,7 +158,8 @@ schedule update "高频检查" --repeat 2h
 schedule update "高频检查" --clear-repeat
 ```
 
-- `--repeat` 支持 `Nm` / `Nh` / `Nd`，**最小 1 分钟**（Windows 限制），上限 31 天
+- `--repeat` 支持 `Nm` / `Nh` / `Nd`，**最小 1 分钟**（Windows 限制），上限 31 天；
+  **不带值**（或传空字符串）表示关闭重复，等价于 `--clear-repeat`
 - `--repeat-duration` 给 `4h` 这类值就是持续时长；不给表示「无限期」（系统任务里不写 Duration）
 - 持续时间必须 ≥ 重复间隔，否则直接报错不落库
 - 写入系统任务的 `<Repetition>`（并置 `StopAtDurationEnd=false`，不会掐掉正在跑的那一次）；
@@ -240,7 +241,7 @@ schedule update "任务名称" --daily 04:00 --dry-run
 | 命令 | `--cmd` / `--command` | 要执行的命令行（原样存库，经 shell 执行） |
 | 调度 | `--daily` `--weekly` `--monthly` `--hourly` `--interval` `--every-days` `--at-startup` | 七选一，给哪个就整体换成哪种调度 |
 | 状态 | `--status active\|paused` | 等价于 `enable` / `pause` |
-| 重复 | `--repeat` / `--repeat-duration` / `--clear-repeat` | 触发器重复间隔（`30m`/`2h`/`1d`，最小 1 分钟），持续时间不给=无限期 |
+| 重复 | `--repeat` / `--repeat-duration` / `--clear-repeat` | 触发器重复间隔（`30m`/`2h`/`1d`，最小 1 分钟）；`--repeat` 不带值即关闭；持续时间不给=无限期 |
 | 分组 | `--group` | 传空字符串表示清空 |
 | 依赖 | `--depends-on` | 传空字符串表示清空 |
 | 工作目录 | `--working-dir` | 传空字符串表示清空 |

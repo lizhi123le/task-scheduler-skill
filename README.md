@@ -102,7 +102,8 @@ active 生效，重建路径也会清空）。
 用 `New-ScheduledTaskTrigger` 生成 `Repetition` 模板塞进现有触发器，一次
 `Set-ScheduledTask -Trigger ... -Settings ...` 同时落重复与设置，并回读校验
 （VERIFY 里是 `REP=PT30M/PT4H`，无限期是 `REP=PT2H/`）。`--repeat` 最小 1 分钟、
-上限 31 天，持续时间不得小于间隔；`--clear-repeat` 关闭；旧库自动 `ALTER TABLE` 补两列。
+上限 31 天，持续时间不得小于间隔；`--repeat` 不带值（或 `--clear-repeat`）关闭；
+旧库自动 `ALTER TABLE` 补两列。
 
 ## 目录
 

@@ -2973,7 +2973,8 @@ def main():
     add_parser.add_argument('--retry-delay', type=int, default=60,
                            help='重试间隔秒数（默认60；Windows 侧最小 1 分钟）')
     add_parser.add_argument('--repeat', dest='repeat_interval', metavar='INTERVAL',
-                           help='触发器重复间隔（如 30m / 2h / 1d，Windows 侧最小 1 分钟）')
+                           nargs='?', const=None, default=None,
+                           help='触发器重复间隔（如 30m / 2h / 1d，Windows 侧最小 1 分钟）；不带值表示不重复')
     add_parser.add_argument('--repeat-duration', dest='repeat_duration', metavar='DURATION',
                            help='重复持续时间（如 4h / 1d；不给表示无限期）')
     
@@ -3015,7 +3016,7 @@ def main():
                --interval VALUE              间隔（如 30m / 4h / 7d）
                --every-days N HH:MM          每 N 天（沿用原日期网格，保住相位）
                --at-startup                  登录时启动（Windows ONLOGON）
-  重复       --repeat INTERVAL        触发器重复间隔（如 30m / 2h / 1d），空串=关闭
+  重复       --repeat INTERVAL        触发器重复间隔（如 30m / 2h / 1d）；不带值=关闭
              --repeat-duration DUR    重复持续时间（如 4h / 1d；不给=无限期）
              --clear-repeat           关闭重复
   状态       --status active|paused  等价于 enable / pause
@@ -3060,8 +3061,8 @@ def main():
     sched_group.add_argument('--at-startup', action='store_true',
                              help='改为开机/登录时执行（Windows ONLOGON）')
     sched_group.add_argument('--repeat', dest='repeat_interval', metavar='INTERVAL',
-                             default=_UNSET,
-                             help='触发器重复间隔（如 30m / 2h；传空字符串表示关闭）')
+                             nargs='?', const=None, default=_UNSET,
+                             help='触发器重复间隔（如 30m / 2h）；不带值或传空字符串表示关闭')
     sched_group.add_argument('--repeat-duration', dest='repeat_duration',
                              metavar='DURATION', default=_UNSET,
                              help='重复持续时间（如 4h / 1d；不给表示无限期）')
