@@ -78,6 +78,21 @@ Windows 上 `subprocess` 为控制台子程序创建进程时，若不传
 不再静默成功。顺带修掉：暂停任务不再被回填 `next_run`（`_sync_next_run_with_windows` 只对
 active 生效，重建路径也会清空）。
 
+### 8. 重试设置没有落到任务计划程序
+
+`retry_count` / `retry_delay` 原先只存在数据库里，`internal-run` 在进程内自己重试；任务计划程序里
+「设置 → 如果任务失败，尝试重新启动」始终是空的。用户改 `--retry-delay 600`，`schedule list`
+看不到、任务计划程序里更看不到，等于改了没反馈。
+
+修法：`_apply_windows_task_settings` 把同一组参数写进系统任务的 `<RestartOnFailure>`
+（`Count` = retry_count，`Interval` = retry_delay，Windows 侧最小 1 分钟）并回读校验
+（日志里是 `RST=PT10M/3`）；`_windows_task_problems` 也会把“系统侧没有重启策略/数值不符”
+报出来，`repair` 能原地修正。实际重试仍由技能内部执行（`internal-run` 正常失败以 0 退出），
+系统级重启只作进程崩溃兜底，**不会双重重试**；`--retry-count 0` 会清掉系统侧重启策略。
+
+注意：如果任务实体由**更高权限**上下文创建，普通进程改不动也删不掉（`Access is denied`），
+需在管理员 PowerShell 里跑 `schedule repair` 重写这组设置。
+
 ## 目录
 
 ```

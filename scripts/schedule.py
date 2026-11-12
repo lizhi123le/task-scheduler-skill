@@ -1050,7 +1050,7 @@ class TaskScheduler:
                 # 必须显式改写，否则任务会"已启用但到点不执行"。
                 # 设置没落盘就别报成功：调用方据此决定是否重试/报错。
                 settings_ok = self._apply_windows_task_settings(
-                    task_name, enabled=(task.status == "active"))
+                    task, enabled=(task.status == "active"))
                 # 让 DB 的 next_run 对齐 Windows 权威网格（StartBoundary + DaysInterval）。
                 # 用 created_at 推算会与系统差一天（整点锚点 vs 带时分秒的创建时刻）。
                 # 暂停的任务没有触发计划，绝不把网格回填进库（否则库里会留下
@@ -1071,8 +1071,34 @@ class TaskScheduler:
             SafePrint.error(f"Windows 任务设置失败: {e}")
             return False
 
-    def _apply_windows_task_settings(self, task_name: str, enabled: bool = True) -> bool:
-        """修正 Windows 任务的电源与补偿设置
+    @staticmethod
+    def _iso_duration_seconds(value: str) -> Optional[int]:
+        """把 Task Scheduler 的 ISO8601 时长（PT10M / PT1H30M / PT30S）解析成秒。
+
+        解析不出来返回 None（校验时按“不符合”处理）。
+        """
+        if not value:
+            return None
+        m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", value.strip())
+        if not m or not any(m.groups()):
+            return None
+        hours, minutes, seconds = (int(x) if x else 0 for x in m.groups())
+        return hours * 3600 + minutes * 60 + seconds
+
+    def _windows_restart_plan(self, task: Task) -> Tuple[int, int]:
+        """任务在 Windows 侧的失败重启策略：(次数, 间隔秒)。
+
+        次数取自 task.retry_count；间隔取自 task.retry_delay，但 Windows 的
+        重启间隔**最小 1 分钟**，更小的值向上取整到 60 秒，否则
+        Set-ScheduledTask 直接报错。次数为 0 表示不配置失败重启。
+        """
+        count = max(0, int(task.retry_count or 0))
+        if count == 0:
+            return 0, 0
+        return count, max(60, int(task.retry_delay or 60))
+
+    def _apply_windows_task_settings(self, task: Task, enabled: bool = True) -> bool:
+        """修正 Windows 任务的电源、补偿与失败重启设置
 
         `schtasks /Create` 生成的任务会带上 Windows 的默认设置：
         - DisallowStartIfOnBatteries=True   用电池时直接不启动
@@ -1083,12 +1109,26 @@ class TaskScheduler:
         显示最后一次结果为 0x800710E0（操作员或管理员拒绝了请求）。
         这里统一改成：允许电池启动、切电池不终止、错过的执行尽快补跑。
 
+        同时把任务的失败重试参数写进「如果任务失败，尝试重新启动」：
+        次数 = retry_count、间隔 = retry_delay（最少 60 秒）。这样任务计划程序里
+        能看到重试配置；实际重试仍由技能内部执行（internal-run 正常失败时以 0
+        退出），只有进程异常崩溃（非 0 退出）才会触发系统级重启，不会双重重试。
+
         注意 `Set-ScheduledTask -Settings` 会连 Settings.Enabled 一起覆盖成默认
         True，所以必须按调用方给的状态显式 Enable/Disable，否则暂停的任务会被
         静默启用，与数据库中的 paused 状态漂移。
         """
         if self.platform != Platform.WINDOWS:
             return True
+
+        task_name = self._windows_task_name(task)
+        restart_count, restart_seconds = self._windows_restart_plan(task)
+        restart_arg = ""
+        if restart_count:
+            restart_arg = (f" -RestartCount {restart_count} "
+                           f"-RestartInterval (New-TimeSpan -Seconds {restart_seconds})")
+        else:
+            restart_arg = " -RestartCount 0"
 
         safe_name = task_name.replace("'", "''")
         state_cmd = 'Enable-ScheduledTask' if enabled else 'Disable-ScheduledTask'
@@ -1097,17 +1137,22 @@ class TaskScheduler:
             "$name = '" + safe_name + "';"
             "$s = New-ScheduledTaskSettingsSet "
             "-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable "
-            "-MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 72);"
+            "-MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 72)"
+            + restart_arg + ";"
             "Set-ScheduledTask -TaskName $name -Settings $s | Out-Null;"
             f"{state_cmd} -TaskName $name | Out-Null;"
             # 回读校验：命令返回 0 只说明调用没报错，不等于设置真的落盘。
             # 这里把实际生效值读回来，失败即判为未生效，避免"任务已建但设置没应用"。
             "$t = Get-ScheduledTask -TaskName $name;"
             "$x = [xml](Export-ScheduledTask -TaskName $name);"
+            "$r = $x.Task.Settings.RestartOnFailure;"
+            "$rst = 'none';"
+            "if ($r -and $r.Interval) { $rst = [string]$r.Interval + '/' + [string]$r.Count };"
             "$want = 'DIB=' + [string]$x.Task.Settings.DisallowStartIfOnBatteries + "
             "' SIB=' + [string]$x.Task.Settings.StopIfGoingOnBatteries + "
             "' SWA=' + [string]$x.Task.Settings.StartWhenAvailable + "
-            "' MIP=' + [string]$x.Task.Settings.MultipleInstancesPolicy;"
+            "' MIP=' + [string]$x.Task.Settings.MultipleInstancesPolicy + "
+            "' RST=' + $rst;"
             "'VERIFY state=' + [string]$t.State + ' ' + $want"
         )
         try:
@@ -1118,14 +1163,13 @@ class TaskScheduler:
             SafePrint.warn("未找到 powershell，未能修正 Windows 任务电源设置")
             return False
 
-        # 校验回读结果：只有四项设置都符合预期才算成功
+        # 校验回读结果：设置项都符合预期才算成功
         verify_line = ""
         for line in (result.stdout or "").splitlines():
             if line.strip().startswith("VERIFY "):
                 verify_line = line.strip()
                 break
 
-        want_state = "Running" if enabled else "Disabled"
         bad = []
         if not verify_line:
             bad.append("未取得回读结果")
@@ -1141,6 +1185,16 @@ class TaskScheduler:
                 bad.append(f"StartWhenAvailable={parts.get('SWA')}")
             if parts.get("MIP") != "IgnoreNew":
                 bad.append(f"MultipleInstancesPolicy={parts.get('MIP')}")
+            # 失败重启：次数/间隔都要和库里一致
+            rst = parts.get("RST") or "none"
+            got_interval, _, got_count = rst.partition("/")
+            if restart_count:
+                got_seconds = self._iso_duration_seconds(got_interval)
+                if got_count != str(restart_count) or got_seconds != restart_seconds:
+                    bad.append(
+                        f"失败重启 {rst} != {restart_seconds}/{restart_count}")
+            elif got_count not in ("", "0"):
+                bad.append(f"失败重启 {rst}（期望关闭）")
             # 状态校验：Enable/Disable 的意图是「别把状态弄反」，而不是「必须在跑」。
             # ⚠️ 已启用但当前空闲的 ScheduledTask，其 State 是 `Ready`
             # （只有正在执行的那几秒才是 `Running`）。此前把期望硬写成 `Running`，
@@ -1167,6 +1221,12 @@ class TaskScheduler:
             + (f" | stderr: {err}" if err else "")
             + (f" | rc={result.returncode}" if result.returncode != 0 else "")
         )
+        if "Access is denied" in err or "拒绝访问" in err or "0x80070005" in err:
+            SafePrint.warn(
+                "提示: 该实体由更高权限的上下文创建，当前进程改不动（连删除也会被拒）；"
+                "请在管理员 PowerShell 里执行 `schedule repair`，"
+                "或 `schedule update <任务名> --retry-count N --retry-delay S` 重写这组设置"
+            )
         return False
     
     # ---------------- 自检 / 修复（系统任务被误删后一键重建） ----------------
@@ -1215,6 +1275,15 @@ class TaskScheduler:
             m = re.search(pattern, xml)
             return m.group(1) if m else default
 
+        # 失败重启策略只在 <RestartOnFailure> 块里取：<Interval> 在 <Repetition>
+        # 里也有，必须限定作用域，否则会拿错值。
+        restart_block = re.search(r"<RestartOnFailure>(.*?)</RestartOnFailure>", xml, re.S)
+        restart_xml = restart_block.group(1) if restart_block else ""
+
+        def grab_restart(pattern: str) -> str:
+            m = re.search(pattern, restart_xml)
+            return m.group(1) if m else ""
+
         return {
             "command": grab(r"<Command>([^<]*)</Command>"),
             "arguments": grab(r"<Arguments>([^<]*)</Arguments>"),
@@ -1224,6 +1293,8 @@ class TaskScheduler:
             "sib": grab(r"<StopIfGoingOnBatteries>([^<]*)</StopIfGoingOnBatteries>").lower(),
             "swa": grab(r"<StartWhenAvailable>([^<]*)</StartWhenAvailable>").lower(),
             "mip": grab(r"<MultipleInstancesPolicy>([^<]*)</MultipleInstancesPolicy>"),
+            "restart_interval": grab_restart(r"<Interval>([^<]*)</Interval>"),
+            "restart_count": grab_restart(r"<Count>(\d+)</Count>"),
         }
 
     def _query_windows_state(self, task_name: str) -> str:
@@ -1340,6 +1411,19 @@ class TaskScheduler:
         if info.get("mip") != "IgnoreNew":
             fix.append(f"MultipleInstancesPolicy={info.get('mip') or '?'}")
 
+        # 失败重启策略：必须与库里的 retry_count / retry_delay 一致
+        # （间隔在 Windows 侧最小 1 分钟，_windows_restart_plan 已按此取整）
+        restart_count, restart_seconds = self._windows_restart_plan(task)
+        got_count = info.get("restart_count") or ""
+        got_interval = info.get("restart_interval") or ""
+        if restart_count:
+            if got_count != str(restart_count):
+                fix.append(f"失败重启次数 {got_count or '未设置'} != {restart_count}")
+            elif self._iso_duration_seconds(got_interval) != restart_seconds:
+                fix.append(f"失败重启间隔 {got_interval or '未设置'} != {restart_seconds} 秒")
+        elif got_count not in ("", "0"):
+            fix.append(f"失败重启 {got_interval or '?'}/{got_count} != 关闭")
+
         if state:
             if task.status == "active" and state == "Disabled":
                 fix.append("系统里是 Disabled，但库里是 active")
@@ -1394,8 +1478,11 @@ class TaskScheduler:
         if info is None:
             return "系统里不存在"
         state = self._query_windows_state(tname) or "?"
+        restart_count, restart_seconds = self._windows_restart_plan(task)
+        restart = (f"{restart_seconds}秒x{restart_count}" if restart_count else "关闭")
         return (f"{tname} | 触发={info.get('start_boundary') or '?'} "
-                f"| 间隔={info.get('days_interval') or '-'}天 | 状态={state}")
+                f"| 间隔={info.get('days_interval') or '-'}天 | 状态={state} "
+                f"| 失败重启={restart}")
 
     def _windows_orphan_ids(self) -> List[int]:
         """系统里存在、数据库里已经没有的 TaskScheduler-<id>-* 的 id。
@@ -1498,7 +1585,7 @@ class TaskScheduler:
                     rows.append((task.name, "将修正", "；".join(fix)))
                     all_ok = False
                     continue
-                ok = self._apply_windows_task_settings(tname, enabled=(task.status == "active"))
+                ok = self._apply_windows_task_settings(task, enabled=(task.status == "active"))
                 rows.append((task.name, "已修正" if ok else "失败", "；".join(fix)))
                 all_ok = all_ok and ok
                 continue
@@ -1964,7 +2051,7 @@ class TaskScheduler:
                     SafePrint.error(f"启用系统任务失败: {result.stderr.strip()}")
                     return False
                 # 旧任务可能仍是"用电池不启动/错过不补跑"的默认设置，一并修正
-                self._apply_windows_task_settings(task_name, enabled=True)
+                self._apply_windows_task_settings(task, enabled=True)
                 # 以 Windows 网格为权威回填 next_run：_calculate_next_run 用的是
                 # created_at 锚点，重建过 StartBoundary 的任务会与系统相位不一致
                 self._sync_next_run_with_windows(task)
@@ -2679,9 +2766,9 @@ def main():
     add_parser.add_argument('--slack-webhook', help='Slack webhook URL')
     add_parser.add_argument('--email', help='通知邮箱')
     add_parser.add_argument('--retry-count', type=int, default=3,
-                           help='失败重试次数（默认3）')
+                           help='失败重试次数（默认3；同时写入任务计划程序的失败重启策略）')
     add_parser.add_argument('--retry-delay', type=int, default=60,
-                           help='重试间隔秒数（默认60）')
+                           help='重试间隔秒数（默认60；Windows 侧最小 1 分钟）')
     
     # list 命令
     list_parser = subparsers.add_parser('list', help='列出所有任务')
@@ -2728,7 +2815,7 @@ def main():
   环境变量   --env KEY=VALUE         可重复；给了就整体替换原环境变量
              --clear-env             清空该任务的环境变量
   重试       --retry-count N         失败重试次数（0 表示不重试）
-             --retry-delay SEC       重试间隔秒数
+             --retry-delay SEC       重试间隔秒数（同时写入任务计划程序的失败重启策略）
   通知       --notify-on-success {slack,email} / --notify-on-fail {slack,email}
              --slack-webhook URL     Slack webhook
              --email ADDR            通知邮箱
@@ -2781,9 +2868,9 @@ def main():
 
     notify_group = update_parser.add_argument_group('重试与通知')
     notify_group.add_argument('--retry-count', dest='retry_count', type=int,
-                              default=_UNSET, help='失败重试次数（0 表示不重试）')
+                              default=_UNSET, help='失败重试次数（0 表示不重试；同时写入任务计划程序的失败重启策略）')
     notify_group.add_argument('--retry-delay', dest='retry_delay', type=int,
-                              default=_UNSET, help='重试间隔秒数')
+                              default=_UNSET, help='重试间隔秒数（Windows 侧最小 1 分钟）')
     notify_group.add_argument('--notify-on-success', dest='notify_on_success',
                               choices=['slack', 'email'], help='成功时的通知方式')
     notify_group.add_argument('--notify-on-fail', dest='notify_on_fail',

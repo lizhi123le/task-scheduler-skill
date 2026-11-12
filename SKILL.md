@@ -122,6 +122,20 @@ schedule add "网络任务" \
   --retry-delay 60
 ```
 
+重试分两层，数值始终一致：
+
+- **实际重试**由技能自身在 `internal-run` 里执行：失败后等 `retry_delay` 秒再跑，最多 `retry_count` 次，
+  每次尝试都写 `execution_logs`（`retry_attempt` 列可看第几次）。
+- **同一组参数会写入 Windows 任务计划程序**的「设置 → 如果任务失败，尝试重新启动」：
+  次数 = `retry_count`、间隔 = `retry_delay`（Windows 侧最小 1 分钟，不足 60 秒按 60 秒写），
+  所以在任务计划程序里能看到这组配置。正常失败由技能内部重试（`internal-run` 以 0 退出），
+  只有进程异常崩溃（非 0 退出）才会触发系统重启，**不会双重重试**。
+- `--retry-count 0` 等于关闭重试，系统侧也会清掉失败重启策略。
+
+> 权限提示：如果任务实体是由**更高权限**的上下文创建的，普通用户既改不动也删不掉
+> （`Access is denied`），此时要在管理员 PowerShell 里执行 `schedule repair` 或
+> `schedule update <任务名> --retry-count N --retry-delay S` 才能重写这组设置。
+
 ### 4. 任务管理
 
 ```bash
@@ -196,7 +210,7 @@ schedule update "任务名称" --daily 04:00 --dry-run
 | 依赖 | `--depends-on` | 传空字符串表示清空 |
 | 工作目录 | `--working-dir` | 传空字符串表示清空 |
 | 环境变量 | `--env KEY=VALUE` / `--clear-env` | 给了 `--env` 就整体替换 |
-| 重试 | `--retry-count` / `--retry-delay` | 次数为 0 表示不重试 |
+| 重试 | `--retry-count` / `--retry-delay` | 次数为 0 表示不重试；同时写入任务计划程序的失败重启策略 |
 | 通知 | `--notify-on-success` / `--notify-on-fail` / `--slack-webhook` / `--email` | slack 或 email |
 | 其它 | `--dry-run` | 只看将改什么，不写库、不动系统任务 |
 
@@ -491,6 +505,17 @@ CREATE TABLE execution_logs (
   不一致自动重建一次；两次仍不一致 → 报错 + 退出码非 0 + 提示 `schedule repair`，不再静默成功
 - 手工兜底：管理员 PowerShell 执行 `schedule repair`（先看差异用 `schedule repair --dry-run`）
 - 顺带修复：暂停任务不再被回填 `next_run`（重建 / `repair` 都会保持为空）
+
+### 重试间隔在任务计划程序里看不到
+- 症状：`--retry-count 3 --retry-delay 600` 执行成功，但任务计划程序 → 设置 →「如果任务失败，
+  尝试重新启动」仍是空/旧值
+- 原因：这组参数要写到系统任务上（`Set-ScheduledTask`）。若实体由**更高权限**的上下文创建，
+  普通用户会得到 `Access is denied`（连删除都会被拒），旧实现只看数据库、不回报失败
+- 现在的处理：`add` / `update` / `repair` 都会把 `retry_count`/`retry_delay` 写进
+  `<RestartOnFailure>` 并回读校验（日志里显示 `RST=PT10M/3`），不一致就重建一次；
+  仍失败会明确报错并以非 0 退出，同时提示去管理员 PowerShell 处理
+- 手工确认：`schtasks /Query /TN "TaskScheduler-<id>-<名称>" /XML | findstr /C:"RestartOnFailure" /C:"Count" /C:"Interval"`
+- 受限时：在**管理员 PowerShell** 里执行 `schedule repair`
 
 ### 序号想从 1 开始连续
 - 一条命令压实：`schedule renumber`（保持现有顺序，把 id 改成 1..N）
