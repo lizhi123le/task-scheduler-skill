@@ -28,28 +28,28 @@ disable-model-invocation: false
 
 ```bash
 # 添加每日任务
-python @scripts/schedule.py add "整理下载" \
+schedule add "整理下载" \
   --command "python organize.py ~/Downloads" \
   --daily 02:00
 
 # 添加带依赖的任务
-python @scripts/schedule.py add "数据同步" \
+schedule add "数据同步" \
   --command "python sync.py" \
   --daily 01:00 \
   --depends-on "数据备份"
 
 # 添加带重试的任务
-python @scripts/schedule.py add "重要任务" \
+schedule add "重要任务" \
   --command "python critical.py" \
   --daily 12:00 \
   --retry-count 5 \
   --retry-delay 300
 
 # 查看所有任务
-python @scripts/schedule.py list
+schedule list
 
 # 查看执行日志
-python @scripts/schedule.py logs
+schedule logs
 ```
 
 ## 核心功能
@@ -58,21 +58,21 @@ python @scripts/schedule.py logs
 
 **每日任务**
 ```bash
-python @scripts/schedule.py add "任务名称" \
+schedule add "任务名称" \
   --command "要执行的命令" \
   --daily HH:MM
 ```
 
 **每周任务**
 ```bash
-python @scripts/schedule.py add "任务名称" \
+schedule add "任务名称" \
   --command "要执行的命令" \
   --weekly {mon|tue|wed|thu|fri|sat|sun} HH:MM
 ```
 
 **每月任务**
 ```bash
-python @scripts/schedule.py add "任务名称" \
+schedule add "任务名称" \
   --command "要执行的命令" \
   --monthly DD HH:MM
 ```
@@ -80,17 +80,17 @@ python @scripts/schedule.py add "任务名称" \
 **自定义间隔**
 ```bash
 # 每N分钟
-python @scripts/schedule.py add "高频检查" \
+schedule add "高频检查" \
   --command "check.sh" \
   --interval 30m
 
 # 每N小时
-python @scripts/schedule.py add "定时同步" \
+schedule add "定时同步" \
   --command "sync.sh" \
   --interval 4h
 
 # 每N天
-python @scripts/schedule.py add "数据清理" \
+schedule add "数据清理" \
   --command "cleanup.sh" \
   --interval 7d
 ```
@@ -99,11 +99,11 @@ python @scripts/schedule.py add "数据清理" \
 
 ```bash
 # 任务B在任务A成功后执行
-python @scripts/schedule.py add "数据备份" \
+schedule add "数据备份" \
   --command "backup.sh" \
   --daily 00:00
 
-python @scripts/schedule.py add "数据同步" \
+schedule add "数据同步" \
   --command "sync.sh" \
   --daily 01:00 \
   --depends-on "数据备份"
@@ -115,7 +115,7 @@ python @scripts/schedule.py add "数据同步" \
 
 ```bash
 # 失败时重试3次，每次间隔60秒
-python @scripts/schedule.py add "网络任务" \
+schedule add "网络任务" \
   --command "python download.py" \
   --daily 10:00 \
   --retry-count 3 \
@@ -126,49 +126,49 @@ python @scripts/schedule.py add "网络任务" \
 
 ```bash
 # 列出所有任务
-python @scripts/schedule.py list
+schedule list
 
 # 暂停任务
-python @scripts/schedule.py pause "任务名称"
+schedule pause "任务名称"
 
 # 启用任务
-python @scripts/schedule.py enable "任务名称"
+schedule enable "任务名称"
 
 # 删除任务
-python @scripts/schedule.py remove "任务名称"
+schedule remove "任务名称"
 
 # 立即运行一次（测试）
-python @scripts/schedule.py run-now "任务名称"
+schedule run-now "任务名称"
 ```
 
 ### 5. 监控与日志（改进）
 
 ```bash
 # 查看所有日志（从 SQLite 数据库）
-python @scripts/schedule.py logs
+schedule logs
 
 # 查看特定任务日志
-python @scripts/schedule.py logs --task "任务名称"
+schedule logs --task "任务名称"
 
 # 查看最近N条日志
-python @scripts/schedule.py logs --last 20
+schedule logs --last 20
 
 # 查看失败的任务
-python @scripts/schedule.py logs --failed
+schedule logs --failed
 ```
 
 ### 6. 通知设置（增强）
 
 ```bash
 # 任务失败时发送Slack通知
-python @scripts/schedule.py add "重要任务" \
+schedule add "重要任务" \
   --command "critical_job.sh" \
   --daily 12:00 \
   --notify-on-fail slack \
   --slack-webhook "https://hooks.slack.com/..."
 
 # 任务完成时发送邮件
-python @scripts/schedule.py add "日报生成" \
+schedule add "日报生成" \
   --command "daily_report.sh" \
   --daily 18:00 \
   --notify-on-success email \
@@ -181,23 +181,23 @@ python @scripts/schedule.py add "日报生成" \
 
 ```bash
 # 将任务分组管理
-python @scripts/schedule.py add "清理日志" \
+schedule add "清理日志" \
   --command "clean_logs.sh" \
   --weekly sun 00:00 \
   --group "维护任务"
 
 # 查看组内任务
-python @scripts/schedule.py list --group "维护任务"
+schedule list --group "维护任务"
 
 # 暂停整个组
-python @scripts/schedule.py pause --group "维护任务"
+schedule pause --group "维护任务"
 ```
 
 ### 8. 环境变量
 
 ```bash
 # 为任务设置环境变量
-python @scripts/schedule.py add "Python脚本" \
+schedule add "Python脚本" \
   --command "python script.py" \
   --daily 10:00 \
   --env "API_KEY=secret123" \
@@ -211,7 +211,7 @@ python @scripts/schedule.py add "Python脚本" \
 
 ```bash
 # 1. 创建 YouTube 下载任务（失败时重试3次）
-python @scripts/schedule.py add "YouTube每日下载" \
+schedule add "YouTube每日下载" \
   --command "python youtube_daily_v2.py" \
   --daily 09:00 \
   --group "视频下载" \
@@ -221,33 +221,33 @@ python @scripts/schedule.py add "YouTube每日下载" \
   --email "admin@example.com"
 
 # 2. 创建整理任务（依赖下载完成）
-python @scripts/schedule.py add "整理下载视频" \
+schedule add "整理下载视频" \
   --command "python organize.py D:/Users/lizhi/Downloads/YouTube_Daily" \
   --daily 10:00 \
   --group "视频下载" \
   --depends-on "YouTube每日下载"
 
 # 3. 查看所有视频相关任务
-python @scripts/schedule.py list --group "视频下载"
+schedule list --group "视频下载"
 ```
 
 ### 场景2: 开发工作流自动化（带依赖链）
 
 ```bash
 # 1. 代码备份
-python @scripts/schedule.py add "代码备份" \
+schedule add "代码备份" \
   --command "bash ~/scripts/backup_code.sh" \
   --daily 02:00
 
 # 2. 运行测试（依赖备份成功）
-python @scripts/schedule.py add "运行测试" \
+schedule add "运行测试" \
   --command "npm test" \
   --daily 02:30 \
   --depends-on "代码备份" \
   --working-dir "~/projects/myapp"
 
 # 3. 生成报告（依赖测试通过）
-python @scripts/schedule.py add "生成测试报告" \
+schedule add "生成测试报告" \
   --command "python generate_report.py" \
   --daily 03:00 \
   --depends-on "运行测试" \
@@ -259,20 +259,20 @@ python @scripts/schedule.py add "生成测试报告" \
 
 ```bash
 # 1. 每天清理系统日志
-python @scripts/schedule.py add "清理系统日志" \
+schedule add "清理系统日志" \
   --command "sudo find /var/log -name '*.log' -mtime +7 -delete" \
   --daily 03:00 \
   --group "系统维护"
 
 # 2. 每周检查磁盘空间
-python @scripts/schedule.py add "磁盘检查" \
+schedule add "磁盘检查" \
   --command "df -h | python check_disk.py" \
   --weekly sun 08:00 \
   --notify-on-fail slack \
   --group "系统维护"
 
 # 3. 每月系统更新
-python @scripts/schedule.py add "系统更新" \
+schedule add "系统更新" \
   --command "sudo apt update && sudo apt upgrade -y" \
   --monthly 1 04:00 \
   --group "系统维护" \
@@ -335,17 +335,17 @@ CREATE TABLE execution_logs (
 
 | 命令 | 说明 | 示例 |
 |------|------|------|
-| `add` | 添加新任务 | `schedule.py add "名称" --command "cmd" --daily 02:00` |
-| `list` | 列出所有任务 | `schedule.py list` |
-| `remove` | 删除任务 | `schedule.py remove "名称"` |
-| `pause` | 暂停任务 | `schedule.py pause "名称"` |
-| `enable` | 启用任务 | `schedule.py enable "名称"` |
-| `run-now` | 立即执行 | `schedule.py run-now "名称"` |
-| `logs` | 查看日志 | `schedule.py logs --task "名称"` |
-| `export` | 导出配置 | `schedule.py export config.json` |
-| `import` | 导入配置（`--overwrite` 覆盖同名任务，`--dry-run` 只看不写） | `schedule.py import config.json` |
-| `repair` | 按数据库重建/校正系统任务（被误删后一键恢复） | `schedule.py repair --dry-run` |
-| `renumber` | 序号压实为 1..N 连续（系统任务名同步改名） | `schedule.py renumber --dry-run` |
+| `add` | 添加新任务 | `schedule add "名称" --command "cmd" --daily 02:00` |
+| `list` | 列出所有任务 | `schedule list` |
+| `remove` | 删除任务 | `schedule remove "名称"` |
+| `pause` | 暂停任务 | `schedule pause "名称"` |
+| `enable` | 启用任务 | `schedule enable "名称"` |
+| `run-now` | 立即执行 | `schedule run-now "名称"` |
+| `logs` | 查看日志 | `schedule logs --task "名称"` |
+| `export` | 导出配置 | `schedule export config.json` |
+| `import` | 导入配置（`--overwrite` 覆盖同名任务，`--dry-run` 只看不写） | `schedule import config.json` |
+| `repair` | 按数据库重建/校正系统任务（被误删后一键恢复） | `schedule repair --dry-run` |
+| `renumber` | 序号压实为 1..N 连续（系统任务名同步改名） | `schedule renumber --dry-run` |
 
 ## 跨平台支持
 
@@ -382,9 +382,9 @@ CREATE TABLE execution_logs (
   `schedule repair` 即可补建系统任务。
 
 ### 任务没有执行
-1. 检查任务状态：`schedule.py list`
-2. 查看错误日志：`schedule.py logs --failed`
-3. 手动测试命令：`schedule.py run-now "任务名"`
+1. 检查任务状态：`schedule list`
+2. 查看错误日志：`schedule logs --failed`
+3. 手动测试命令：`schedule run-now "任务名"`
 4. 检查系统调度器：
    - Windows: `schtasks /query /tn "TaskScheduler-*" /v /fo LIST`
    - Linux: `crontab -l`
@@ -394,7 +394,7 @@ CREATE TABLE execution_logs (
    - 用 `Get-ScheduledTask -TaskName 'TaskScheduler-*' | Select TaskName,Settings` 确认
      `DisallowStartIfOnBatteries=False`、`StopIfGoingOnBatteries=False`、`StartWhenAvailable=True`
    - `schtasks /Create` 默认给的是 `True/True/False`（用电池不启动、切电池杀进程、错过不补跑），
-     笔记本睡眠/拔电场景下就会表现为"没定期执行"；`schedule.py enable <名称>` 会重新修正这三项
+     笔记本睡眠/拔电场景下就会表现为"没定期执行"；`schedule enable <名称>` 会重新修正这三项
    - 任务默认只在用户登录时运行（Interactive），要在未登录时也跑需要额外的凭据配置
 
 ### 系统任务被删掉（杀毒 / 清理软件隔离）
@@ -432,7 +432,7 @@ CREATE TABLE execution_logs (
 4. **错误处理**：为重要任务设置重试和通知
 5. **依赖管理**：合理使用依赖关系组织任务链
 6. **资源管理**：避免同时运行大量任务
-7. **备份配置**：定期导出配置：`schedule.py export`
+7. **备份配置**：定期导出配置：`schedule export`
 
 ## 升级说明（从 v1.0）
 
@@ -441,10 +441,10 @@ v2.0 使用 SQLite 代替 JSON 文件存储，自动迁移数据。
 如需保留旧数据：
 ```bash
 # 导出旧配置
-python schedule.py export old_config.json
+schedule export old_config.json
 
 # 导入到 v2.0
-python schedule.py import old_config.json
+schedule import old_config.json
 ```
 
 ## 相关技能

@@ -2319,7 +2319,11 @@ def _validate_schedule_value(schedule_type: str, schedule_value: str) -> Optiona
 
 
 def main():
-    parser = argparse.ArgumentParser(        description='跨平台定时任务管理器 v2.0',
+    # prog 固定为 `schedule`：让 --help / usage / 示例里的命令名与全局命令一致。
+    # 不写死的话，经 schedule.ps1 → python schedule.py 调用时 %(prog)s 会展开成
+    # "schedule.py"，文档与帮助里就会出现 `schedule.py add ...` 这种不该出现的写法。
+    parser = argparse.ArgumentParser(prog='schedule',
+        description='跨平台定时任务管理器 v2.0',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
