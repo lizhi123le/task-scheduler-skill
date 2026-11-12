@@ -210,6 +210,9 @@ schedule update "任务名称" --daily 04:00 --dry-run
   `--every-days` / `--at-startup`）。
 - 任务不存在、改名撞名、命令为空、调度时间非法 → 直接报错，不落库、不动系统任务。
 - `every_days` 改时间时沿用旧 `next_run` 的日期网格，**不会**把「每 3 天」的任务整体挪到今天。
+- 改完会**回读系统计划任务**核对（触发时间 / 间隔 / 入口命令 / 启用状态）：对不上就自动重建一次；
+  两次仍对不上则报错并以非 0 退出（数据库已更新），用管理员 PowerShell `schedule repair` 兜底。
+- 暂停的任务改完仍保持暂停：系统实体是 Disabled，库里不留 `next_run`。
 - 统计字段（`run_count` / `fail_count` / `last_run` / `created_at`）不开放修改；`next_run` 自动重算。
 
 ### 6. 监控与日志（改进）
@@ -478,6 +481,16 @@ CREATE TABLE execution_logs (
 - 判定规则：实体缺失 / 入口命令不符 / 触发器与库里调度不一致 → 整条重建；
   只有电源设置或启用状态不符 → 原地修正（保留历史与统计）
 - 重建时用库里的 `next_run` 作网格锚点，保住"每 N 天"任务的相位，不会被挪到今天
+
+### `update` 改了，但任务计划程序里没变化
+- 症状：`schedule update ... --daily 03:30` 之后 `schedule list` 已是新时间，但任务计划程序里
+  触发器还是旧的，或者实体干脆不见了
+- 原因：`schtasks /Create` 返回 0 只说明命令没报错 —— 权限、杀软拦截、`/TN` 超长（>237 字符）、
+  `Set-ScheduledTask` 失败等情况都可能让实体**没真正落到系统里**，旧实现照样打印“已创建”
+- 现在的处理：`update` 建完会**回读系统实体**逐项核对（触发时间 / 间隔 / 入口命令 / 启用状态），
+  不一致自动重建一次；两次仍不一致 → 报错 + 退出码非 0 + 提示 `schedule repair`，不再静默成功
+- 手工兜底：管理员 PowerShell 执行 `schedule repair`（先看差异用 `schedule repair --dry-run`）
+- 顺带修复：暂停任务不再被回填 `next_run`（重建 / `repair` 都会保持为空）
 
 ### 序号想从 1 开始连续
 - 一条命令压实：`schedule renumber`（保持现有顺序，把 id 改成 1..N）

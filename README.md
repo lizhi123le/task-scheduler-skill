@@ -67,6 +67,17 @@ Windows 上 `subprocess` 为控制台子程序创建进程时，若不传
   也是 pythonw，会让子进程一并变成无窗口进程，其写往管道 stdout 的输出全部丢失
   （实测 `execution_logs.output` 由 5769 字节掉到 0，而任务仍报 SUCCESS）。
 
+### 7. 系统计划任务“假成功”
+
+`_setup_windows_task` 原先只看 `schtasks /Create` 的返回码就打印“任务已创建”。可返回码 0
+只代表命令没报错：权限、杀软拦截、`/TN` 超长、`Set-ScheduledTask` 失败都可能让实体**没真正
+落盘**，于是出现「`update` 改了调度，任务计划程序里还是旧的」这类现象。
+
+修法：`add` / `update` 建完回读系统实体，逐项核对触发时间、间隔、入口命令与启用状态；
+不一致自动重建一次。`update` 两次仍不一致就以**非 0 退出码**报错并提示 `schedule repair`，
+不再静默成功。顺带修掉：暂停任务不再被回填 `next_run`（`_sync_next_run_with_windows` 只对
+active 生效，重建路径也会清空）。
+
 ## 目录
 
 ```

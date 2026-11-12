@@ -599,7 +599,13 @@ class TaskScheduler:
             return None
 
     def _sync_next_run_with_windows(self, task: Task) -> bool:
-        """把 DB 的 next_run 对齐到 Windows 权威值；有变化则写库。返回是否已更新。"""
+        """把 DB 的 next_run 对齐到 Windows 权威值；有变化则写库。返回是否已更新。
+
+        暂停的任务没有触发计划，不回填：否则库里会留下“暂停中却仍有 next_run”
+        的陈旧值（显示层虽已屏蔽，但导出/直接读库会被误导）。
+        """
+        if task.status != "active":
+            return False
         wn = self._windows_next_run(task)
         if not wn or wn == task.next_run:
             return False
@@ -734,8 +740,8 @@ class TaskScheduler:
         
         self.tasks.append(task)
         
-        # 设置系统级调度器
-        scheduler_result = self._setup_system_scheduler(task)
+        # 设置系统级调度器（含回读校验，创建没落盘时会自动重试一次）
+        scheduler_result = self._ensure_system_task(task)
         if not scheduler_result:
             SafePrint.warn("系统调度器设置失败，但任务已保存到数据库")
         
@@ -891,11 +897,10 @@ class TaskScheduler:
             except ValueError:
                 anchor = None
 
-        if not self._setup_system_scheduler(draft, anchor=anchor):
-            SafePrint.warn("系统计划任务重建失败，可稍后执行 `schedule repair`")
+        system_ok = self._ensure_system_task(draft, anchor=anchor)
 
         # 暂停任务：实体处于禁用态，库里不留 next_run（与 pause_task 语义一致）
-        if draft.status == 'paused':
+        if draft.status == 'paused' and draft.next_run is not None:
             draft.next_run = None
             self.db.save_task(draft)
 
@@ -910,10 +915,25 @@ class TaskScheduler:
                                    f"{task.name} -> {draft.name}")
 
         for line in changes:
-            SafePrint.success(line)
-        SafePrint.success(f"任务 '{draft.name}' 已更新"
-                          + (f"（下次执行 {draft.next_run[:16]}）" if draft.next_run else ""))
-        return True
+            if system_ok:
+                SafePrint.success(line)
+            else:
+                SafePrint.info(f"  - {line}")
+
+        snapshot = self._windows_entity_snapshot(draft)
+        if system_ok:
+            if snapshot:
+                SafePrint.info(f"系统计划任务: {snapshot}")
+            SafePrint.success(f"任务 '{draft.name}' 已更新"
+                              + (f"（下次执行 {draft.next_run[:16]}）" if draft.next_run else ""))
+            return True
+
+        # 系统侧没能同步：库里已改，明确报错而不是静默“成功”
+        if snapshot:
+            SafePrint.info(f"当前系统计划任务: {snapshot}")
+        SafePrint.error("系统计划任务未能同步（数据库已更新）；"
+                        "请用管理员 PowerShell 执行 `schedule repair` 重建")
+        return False
 
     def _every_days_next_run(self, task: Task, old_next_run: str) -> Optional[str]:
         """every_days 改时间时，沿用旧 next_run 的日期网格 + 新调度的时间。
@@ -1027,13 +1047,22 @@ class TaskScheduler:
                 if anchor is not None:
                     self._set_windows_start_boundary(task_name, anchor)
                 # schtasks 会继承 Windows 默认设置（用电池不启动、错过不补跑），
-                # 必须显式改写，否则任务会"已启用但到点不执行"
-                self._apply_windows_task_settings(task_name, enabled=(task.status == "active"))
+                # 必须显式改写，否则任务会"已启用但到点不执行"。
+                # 设置没落盘就别报成功：调用方据此决定是否重试/报错。
+                settings_ok = self._apply_windows_task_settings(
+                    task_name, enabled=(task.status == "active"))
                 # 让 DB 的 next_run 对齐 Windows 权威网格（StartBoundary + DaysInterval）。
                 # 用 created_at 推算会与系统差一天（整点锚点 vs 带时分秒的创建时刻）。
-                if sync_db and self._sync_next_run_with_windows(task):
-                    SafePrint.info(f"next_run 已按 Windows 网格校准为 {task.next_run}")
-                return True
+                # 暂停的任务没有触发计划，绝不把网格回填进库（否则库里会留下
+                # “暂停中却仍有 next_run”的陈旧值，与 pause_task 的语义矛盾）。
+                if sync_db:
+                    if task.status == "active":
+                        if self._sync_next_run_with_windows(task):
+                            SafePrint.info(f"next_run 已按 Windows 网格校准为 {task.next_run}")
+                    elif task.next_run is not None:
+                        task.next_run = None
+                        self.db.save_task(task)
+                return settings_ok
             else:
                 SafePrint.error(f"Windows 任务创建失败: {result.stderr}")
                 return False
@@ -1318,6 +1347,56 @@ class TaskScheduler:
                 fix.append(f"系统里是 {state}，但库里是 paused")
         return rebuild, fix
 
+    def _windows_entity_problems(self, task: Task) -> List[str]:
+        """回读系统实体，返回与库里记录不一致的项（空列表 = 一致）。
+
+        Windows 上 schtasks /Create 返回 0 只说明命令没报错；实际可能因权限、
+        杀软拦截或注册表写入失败而**没有真正落盘**，此时实体仍是旧的（或压根
+        没有）。update 改完调度后必须回读一次，才能保证“改了就是改了”。
+        """
+        if self.platform != Platform.WINDOWS:
+            return []
+        tname = self._windows_task_name(task)
+        info = self._query_windows_task(tname)
+        if info is None:
+            return ["系统里不存在"]
+        rebuild, fix = self._windows_task_problems(
+            task, info, self._query_windows_state(tname))
+        return rebuild + fix
+
+    def _ensure_system_task(self, task: Task,
+                            anchor: Optional[datetime] = None) -> bool:
+        """建/重建系统计划任务并回读校验，不一致时自动重建一次。
+
+        返回 False 表示两次尝试后系统实体与数据库仍对不上 —— 调用方必须
+        把这个结果当失败（打印原因、必要时退出码非 0），而不是“建过了就算”。
+        """
+        ok = self._setup_system_scheduler(task, anchor=anchor)
+        problems = self._windows_entity_problems(task)
+        if problems or not ok:
+            if problems:
+                SafePrint.warn(f"系统计划任务与数据库不一致（{'；'.join(problems)}），自动重建一次")
+            else:
+                SafePrint.warn("系统计划任务创建报告失败，自动重试一次")
+            ok = self._setup_system_scheduler(task, anchor=anchor)
+            problems = self._windows_entity_problems(task)
+        if problems:
+            SafePrint.error(f"系统计划任务仍未同步: {'；'.join(problems)}")
+            return False
+        return ok
+
+    def _windows_entity_snapshot(self, task: Task) -> str:
+        """一行摘要（触发时间/状态），给 update 用作用户可见的回读证据。"""
+        if self.platform != Platform.WINDOWS:
+            return ""
+        tname = self._windows_task_name(task)
+        info = self._query_windows_task(tname)
+        if info is None:
+            return "系统里不存在"
+        state = self._query_windows_state(tname) or "?"
+        return (f"{tname} | 触发={info.get('start_boundary') or '?'} "
+                f"| 间隔={info.get('days_interval') or '-'}天 | 状态={state}")
+
     def _windows_orphan_ids(self) -> List[int]:
         """系统里存在、数据库里已经没有的 TaskScheduler-<id>-* 的 id。
 
@@ -1425,7 +1504,12 @@ class TaskScheduler:
                 continue
 
             if not dry_run:
-                self._sync_next_run_with_windows(task)
+                if task.status == "active":
+                    self._sync_next_run_with_windows(task)
+                elif task.next_run is not None:
+                    # 暂停任务不该有 next_run，顺手清掉陈旧值
+                    task.next_run = None
+                    self.db.save_task(task)
             rows.append((task.name, "正常", ""))
 
         orphan_ids = self._windows_orphan_ids()
