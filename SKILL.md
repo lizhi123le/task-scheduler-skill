@@ -343,7 +343,7 @@ CREATE TABLE execution_logs (
 | `run-now` | 立即执行 | `schedule.py run-now "名称"` |
 | `logs` | 查看日志 | `schedule.py logs --task "名称"` |
 | `export` | 导出配置 | `schedule.py export config.json` |
-| `import` | 导入配置 | `schedule.py import config.json` |
+| `import` | 导入配置（`--overwrite` 覆盖同名任务，`--dry-run` 只看不写） | `schedule.py import config.json` |
 | `repair` | 按数据库重建/校正系统任务（被误删后一键恢复） | `schedule.py repair --dry-run` |
 | `renumber` | 序号压实为 1..N 连续（系统任务名同步改名） | `schedule.py renumber --dry-run` |
 
@@ -366,6 +366,20 @@ CREATE TABLE execution_logs (
 - ✅ 兼容所有发行版
 
 ## 故障排除
+
+### 导入报 `TypeError: Task.__init__() missing 1 required positional argument: 'id'`（已修复）
+- 原因：旧版 `import` 先 `task_data.pop('id')` 再 `Task(**task_data)`，而 `id` 在 dataclass 里是**必填**字段，
+  去掉它必然 TypeError，一条任务都进不来。
+- 现在的行为：
+  - `id` 一律丢弃，由 `_get_next_id()` 重新发号（id 已编进系统任务名，不能照搬别的机器的号）；
+  - 未知字段（如手工加的 `group_name`、`comment`）自动忽略并提示，不再整份导入失败；
+  - 单条脏数据（缺 `name`、时间写成 `25:00`、`env_vars` 不是对象）只跳过该条并报错；
+  - `env_vars` 允许是对象或 JSON 字符串；`running/failed` 归位为 `active`，`disabled` 归位为 `paused`；
+  - 同名任务默认**跳过**（保住现有执行历史与系统任务名），加 `--overwrite` 才就地覆盖；
+  - `--dry-run` 只解析并打印将导入什么，不写库、不建系统任务。
+- `startup`（ONLOGON）任务在**非管理员** PowerShell 里创建会报 `ERROR: Access is denied.`，
+  这是 Windows 的权限限制而非脚本问题：数据库行仍会写入，用管理员 PowerShell 跑
+  `schedule repair` 即可补建系统任务。
 
 ### 任务没有执行
 1. 检查任务状态：`schedule.py list`

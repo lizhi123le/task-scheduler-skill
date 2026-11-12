@@ -40,7 +40,7 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, fields
 from enum import Enum
 import threading
 import traceback
@@ -1992,28 +1992,200 @@ class TaskScheduler:
             json.dump(data, f, indent=2, ensure_ascii=False)
         SafePrint.success(f"配置已导出到: {output_file}")
     
-    def import_config(self, input_file: str):
-        """导入配置"""
+    _IMPORT_ALIASES = {'group_name': 'group'}
+
+    def _task_kwargs_from_import(self, raw: Any) -> Dict[str, Any]:
+        """把导出文件里的一条任务记录规整成 Task 的构造参数（不含 id）。
+
+        导出文件是 `asdict(Task)` 的结果，字段本应与 Task 一一对应，但导入方必须
+        容忍三种现实情况 —— 直接 `Task(**task_data)` 会在这三种情况下全线崩掉：
+        1. `id` 是 **必填** 字段（无默认值）。旧实现先 `pop('id')` 再构造，必然抛
+           `Task.__init__() missing 1 required positional argument: 'id'`；
+           而导出的 id 也不能照搬：id 已经编进系统任务名 `TaskScheduler-<id>-<name>`，
+           且必须单调递增发号，所以这里丢掉 id，由调用方用 `_get_next_id()` 重新分配。
+        2. 不同版本 / 手改过的文件可能多出 `group_name`、`comment` 之类的键，
+           多一个未知键就是 TypeError；这里按 Task 的字段白名单过滤，未知键忽略并提示。
+        3. 脏数据（缺 name、调度值写错、env_vars 是 JSON 字符串）应该逐条跳过并报错，
+           而不是让整份配置一条都进不来。
+
+        返回值可直接拆成 `Task(id=..., **kwargs)`。
+        """
+        if not isinstance(raw, dict):
+            raise ValueError("任务记录不是 JSON 对象")
+
+        known = {f.name for f in fields(Task)}
+        kwargs: Dict[str, Any] = {}
+        ignored: List[str] = []
+        for key, value in raw.items():
+            name = self._IMPORT_ALIASES.get(key, key)
+            if name == 'id':
+                continue  # 重新发号，见上方说明
+            if name not in known:
+                ignored.append(key)
+                continue
+            kwargs[name] = value
+        if ignored:
+            SafePrint.warn(f"忽略未知字段: {', '.join(ignored)}")
+
+        # 必填字段：缺失或不是非空字符串就整条跳过（不让脏数据打断其它任务）
+        for required in ('name', 'command', 'schedule_type', 'schedule_value'):
+            value = kwargs.get(required)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"缺少必填字段 '{required}'")
+            kwargs[required] = value.strip()
+
+        schedule_type = kwargs['schedule_type'].lower()
+        kwargs['schedule_type'] = schedule_type
+        if schedule_type not in ('hourly', 'daily', 'every_days', 'weekly',
+                                 'monthly', 'interval', 'startup'):
+            raise ValueError(f"未知调度类型 '{schedule_type}'")
+        err = _validate_schedule_value(schedule_type, kwargs['schedule_value'])
+        if err:
+            raise ValueError(err)
+
+        # 状态归位：running/failed 是执行态残留，disabled 等同于暂停
+        status = str(kwargs.get('status') or 'active').strip().lower()
+        if status in ('paused', 'disabled'):
+            kwargs['status'] = 'paused'
+        elif status in ('active', 'running', 'failed'):
+            kwargs['status'] = 'active'
+        else:
+            SafePrint.warn(f"任务 '{kwargs['name']}' 的状态 '{status}' 无法识别，按 active 导入")
+            kwargs['status'] = 'active'
+
+        # env_vars：库里存的是 JSON 文本，导出后是 dict；手工文件里也可能是 JSON 字符串
+        env = kwargs.get('env_vars')
+        if env in (None, ''):
+            kwargs['env_vars'] = {}
+        elif isinstance(env, dict):
+            kwargs['env_vars'] = {str(k): str(v) for k, v in env.items()}
+        elif isinstance(env, str):
+            try:
+                parsed = json.loads(env) if env.strip() else {}
+            except ValueError:
+                raise ValueError(f"env_vars 不是合法 JSON: {env!r}")
+            if not isinstance(parsed, dict):
+                raise ValueError("env_vars 应为对象")
+            kwargs['env_vars'] = {str(k): str(v) for k, v in parsed.items()}
+        else:
+            raise ValueError("env_vars 应为对象或 JSON 字符串")
+
+        # 计数字段：脏值退回默认值，负数归零
+        for key, default in (('run_count', 0), ('fail_count', 0),
+                             ('retry_count', 3), ('retry_delay', 60)):
+            try:
+                value = int(kwargs.get(key, default))
+            except (TypeError, ValueError):
+                value = default
+            kwargs[key] = max(0, value)
+
+        # 可选字符串字段：非字符串一律当空，避免写库时类型噪声
+        for key in ('created_at', 'last_run', 'next_run', 'group', 'depends_on',
+                    'working_dir', 'notify_on_success', 'notify_on_fail',
+                    'slack_webhook', 'email'):
+            if kwargs.get(key) is not None and not isinstance(kwargs[key], str):
+                kwargs[key] = None
+
+        # next_run 不照搬：暂停的任务没有触发计划，启用的任务按本机时钟重算
+        kwargs.pop('next_run', None)
+        return kwargs
+
+    def import_config(self, input_file: str, overwrite: bool = False,
+                      dry_run: bool = False) -> bool:
+        """导入配置
+
+        overwrite：同名任务已存在时默认跳过（避免误把现有任务的统计和历史抹掉），
+                   加 --overwrite 才就地覆盖（保留原 id，系统任务名不会漂移）。
+        dry_run：只解析并打印将导入什么，不写库、不建系统任务。
+        """
         try:
             with open(input_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            
-            imported = 0
-            for task_data in data.get('tasks', []):
-                # 移除 id，让系统自动分配
-                task_data.pop('id', None)
-                task = Task(**task_data)
-                task.id = self._get_next_id()
-                
-                if self.db.save_task(task):
-                    self.tasks.append(task)
-                    self._setup_system_scheduler(task)
-                    imported += 1
-            
-            SafePrint.success(f"成功导入 {imported} 个任务")
-        except Exception as e:
-            SafePrint.error(f"导入失败: {e}")
-            traceback.print_exc()
+        except OSError as e:
+            SafePrint.error(f"读取配置文件失败: {e}")
+            return False
+        except ValueError as e:
+            SafePrint.error(f"配置文件不是合法 JSON: {e}")
+            return False
+
+        if not isinstance(data, dict):
+            SafePrint.error("配置格式错误：根节点应为 JSON 对象")
+            return False
+        raw_tasks = data.get('tasks')
+        if not isinstance(raw_tasks, list):
+            SafePrint.error("配置格式错误：缺少 'tasks' 数组")
+            return False
+
+        settings = data.get('settings') if isinstance(data.get('settings'), dict) else {}
+        version = str(settings.get('version') or '')
+        if version and version != '2.0':
+            SafePrint.warn(f"配置版本为 {version}，将按 2.0 字段尽力导入")
+
+        imported = skipped = failed = 0
+        for index, raw in enumerate(raw_tasks, 1):
+            try:
+                kwargs = self._task_kwargs_from_import(raw)
+            except ValueError as e:
+                failed += 1
+                SafePrint.error(f"第 {index} 条任务导入失败: {e}")
+                continue
+
+            name = kwargs['name']
+            existing = next((t for t in self.tasks if t.name == name), None)
+            if existing is not None and not overwrite:
+                skipped += 1
+                SafePrint.warn(f"任务 '{name}' 已存在，已跳过（加 --overwrite 可覆盖）")
+                continue
+
+            if dry_run:
+                SafePrint.info(f"[DRY-RUN] {name} -> "
+                               f"{format_schedule_str(Task(id=0, **kwargs))}")
+                imported += 1
+                continue
+
+            paused = kwargs['status'] == 'paused'
+
+            # 先由建/改两种分支得到最终 task 对象
+            if existing is not None:
+                # 就地覆盖并保留原 id：INSERT OR REPLACE 在 name 唯一键上会把旧行
+                # 整行删掉再插新 id，等于静默丢失原有执行历史与 id
+                task = existing
+                new_id = task.id
+                for key, value in kwargs.items():
+                    setattr(task, key, value)
+                task.id = new_id
+            else:
+                task = Task(id=self._get_next_id(), **kwargs)
+
+            # 暂停的任务库里不该留 next_run（与 pause_task 的语义保持一致）
+            task.next_run = None if paused else self._calculate_next_run(task)
+
+            if not self.db.save_task(task):
+                failed += 1
+                continue
+            if existing is None:
+                self.tasks.append(task)
+
+            # 系统调度器：与 add 保持一致；暂停任务照样建实体再禁用（_setup_windows_task
+            # 内部已按 task.status 决定启用/禁用），这样 `enable` 里的
+            # schtasks /Change /ENABLE 才有对象可用。
+            if not self._setup_system_scheduler(task):
+                SafePrint.warn(f"任务 '{name}' 的系统计划任务创建失败，可稍后执行 `schedule repair`")
+            if paused:
+                # 建成功后 _setup_windows_task 会用 Windows 网格回填 next_run，
+                # 这里再按"暂停无触发计划"的语义钉回 None，保证 DB 与系统任务不漂移
+                task.next_run = None
+                self.db.save_task(task)
+
+            imported += 1
+
+        if dry_run:
+            SafePrint.info(f"[DRY-RUN] 可导入 {imported} 个任务，跳过 {skipped} 个，失败 {failed} 个")
+        else:
+            SafePrint.success(f"成功导入 {imported} 个任务"
+                              + (f"，跳过 {skipped} 个" if skipped else "")
+                              + (f"，失败 {failed} 个" if failed else ""))
+        return failed == 0
 
 
 def format_schedule_str(task: Task) -> str:
@@ -2241,6 +2413,10 @@ def main():
     # import 命令
     import_parser = subparsers.add_parser('import', help='导入配置')
     import_parser.add_argument('file', help='输入文件路径')
+    import_parser.add_argument('--overwrite', action='store_true',
+                               help='同名任务已存在时覆盖（默认跳过，保留现有统计）')
+    import_parser.add_argument('--dry-run', action='store_true',
+                               help='只解析并显示将导入什么，不写库、不建系统任务')
     
     # repair 命令
     repair_parser = subparsers.add_parser(
@@ -2410,7 +2586,9 @@ def main():
         scheduler.export_config(args.file)
     
     elif args.command == 'import':
-        scheduler.import_config(args.file)
+        if not scheduler.import_config(args.file, overwrite=args.overwrite,
+                                       dry_run=args.dry_run):
+            sys.exit(1)
 
     elif args.command == 'repair':
         ok = scheduler.repair_tasks(dry_run=args.dry_run, prune=args.prune, only=args.task)
