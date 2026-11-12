@@ -1,35 +1,35 @@
 #!/usr/bin/env pwsh
-# Task Scheduler - æ·»åŠ åˆ°å…¨å±€ç¯å¢ƒå˜é‡è„šæœ¬ (PowerShell)
-# å†™å…¥å½“å‰ç”¨æˆ·çš„ç”¨æˆ·ç¯å¢ƒå˜é‡ï¼Œæ— éœ€ç®¡ç†å‘˜æƒé™
+# Task Scheduler - Ìí¼Óµ½È«¾Ö»·¾³±äÁ¿½Å±¾ (PowerShell)
+# Ğ´Èëµ±Ç°ÓÃ»§µÄÓÃ»§»·¾³±äÁ¿£¬ÎŞĞè¹ÜÀíÔ±È¨ÏŞ
 
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "Task Scheduler - Global Environment Setup" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
 
-# è®¾ç½®å˜é‡
-$taskSchedulerDir = "$env:USERPROFILE\.config\opencode\skills\task-scheduler"
+# ÉèÖÃ±äÁ¿
+$taskSchedulerDir = "$env:USERPROFILE\.dsh\skills\task-scheduler"
 $pathEntry = $taskSchedulerDir
 
-# æ£€æŸ¥ç›®å½•æ˜¯å¦å­˜åœ¨
+# ¼ì²éÄ¿Â¼ÊÇ·ñ´æÔÚ
 if (-not (Test-Path $taskSchedulerDir)) {
-    Write-Host "[ERROR] ç›®å½•ä¸å­˜åœ¨: $taskSchedulerDir" -ForegroundColor Red
-    Write-Host "è¯·ç¡®è®¤ task-scheduler æŠ€èƒ½å·²æ­£ç¡®å®‰è£…" -ForegroundColor Yellow
+    Write-Host "[ERROR] Ä¿Â¼²»´æÔÚ: $taskSchedulerDir" -ForegroundColor Red
+    Write-Host "ÇëÈ·ÈÏ task-scheduler ¼¼ÄÜÒÑÕıÈ·°²×°" -ForegroundColor Yellow
     pause
     exit 1
 }
 
-Write-Host "[INFO] Task Scheduler ç›®å½•: $taskSchedulerDir" -ForegroundColor Green
+Write-Host "[INFO] Task Scheduler Ä¿Â¼: $taskSchedulerDir" -ForegroundColor Green
 Write-Host ""
 
-# è·å–å½“å‰ç”¨æˆ· PATH
+# »ñÈ¡µ±Ç°ÓÃ»§ PATH
 $currentPath = [Environment]::GetEnvironmentVariable("PATH", "User")
 
-# æ£€æŸ¥æ˜¯å¦å·²åœ¨ PATH ä¸­
+# ¼ì²éÊÇ·ñÒÑÔÚ PATH ÖĞ
 if ($currentPath -like "*$pathEntry*") {
-    Write-Host "[OK] å·²åœ¨ PATH ä¸­ï¼Œè·³è¿‡æ·»åŠ " -ForegroundColor Green
+    Write-Host "[OK] ÒÑÔÚ PATH ÖĞ£¬Ìø¹ıÌí¼Ó" -ForegroundColor Green
 } else {
-    # æ·»åŠ åˆ° PATH (æ³¨å†Œè¡¨ APIï¼Œä¸å— setx 1024 å­—ç¬¦é™åˆ¶)
+    # Ìí¼Óµ½ PATH (×¢²á±í API£¬²»ÊÜ setx 1024 ×Ö·ûÏŞÖÆ)
     if ([string]::IsNullOrEmpty($currentPath)) {
         $newPath = $pathEntry
     } else {
@@ -37,19 +37,19 @@ if ($currentPath -like "*$pathEntry*") {
     }
 
     [Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
-    Write-Host "[OK] å·²æ·»åŠ åˆ°ç”¨æˆ· PATH" -ForegroundColor Green
+    Write-Host "[OK] ÒÑÌí¼Óµ½ÓÃ»§ PATH" -ForegroundColor Green
 }
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "å®‰è£…å®Œæˆï¼" -ForegroundColor Green
+Write-Host "°²×°Íê³É£¡" -ForegroundColor Green
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "ä½¿ç”¨æ–¹æ³•:" -ForegroundColor Yellow
-Write-Host "  schedule list              - æŸ¥çœ‹æ‰€æœ‰ä»»åŠ¡"
-Write-Host "  schedule add 'ä»»åŠ¡å' ...  - æ·»åŠ æ–°ä»»åŠ¡"
-Write-Host "  schedule logs              - æŸ¥çœ‹æ—¥å¿—"
+Write-Host "Ê¹ÓÃ·½·¨:" -ForegroundColor Yellow
+Write-Host "  schedule list              - ²é¿´ËùÓĞÈÎÎñ"
+Write-Host "  schedule add 'ÈÎÎñÃû' ...  - Ìí¼ÓĞÂÈÎÎñ"
+Write-Host "  schedule logs              - ²é¿´ÈÕÖ¾"
 Write-Host ""
-Write-Host "æ³¨æ„: è¯·é‡æ–°æ‰“å¼€ PowerShell çª—å£ä»¥ä½¿æ›´æ”¹ç”Ÿæ•ˆ" -ForegroundColor Magenta
+Write-Host "×¢Òâ: ÇëÖØĞÂ´ò¿ª PowerShell ´°¿ÚÒÔÊ¹¸ü¸ÄÉúĞ§" -ForegroundColor Magenta
 Write-Host ""
 pause

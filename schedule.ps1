@@ -1,13 +1,13 @@
 #!/usr/bin/env pwsh
-# Task Scheduler - PowerShell å…¨å±€å‘½ä»¤åŒ…è£…å™¨
-# å…è®¸åœ¨ä»»æ„ç›®å½•ç›´æ¥è¿è¡Œ schedule å‘½ä»¤
+# Task Scheduler - PowerShell È«¾ÖÃüÁî°ü×°Æ÷
+# ÔÊĞíÔÚÈÎÒâÄ¿Â¼Ö±½ÓÔËĞĞ schedule ÃüÁî
 #
-# è·¯å¾„ç”± $PSScriptRoot æ¨å¯¼ï¼ˆåŸä¸ºå†™æ­»çš„ç»å¯¹è·¯å¾„ï¼Œæ¢æœºå³å¤±æ•ˆï¼‰ã€‚
+# Â·¾¶ÓÉ $PSScriptRoot ÍÆµ¼£¨Ô­ÎªĞ´ËÀµÄ¾ø¶ÔÂ·¾¶£¬»»»ú¼´Ê§Ğ§£©¡£
 
 $scriptPath = Join-Path $PSScriptRoot 'scripts/schedule.py'
 
 if (-not (Test-Path -LiteralPath $scriptPath)) {
-    Write-Error "æ‰¾ä¸åˆ° schedule.pyï¼š$scriptPath"
+    Write-Error "ÕÒ²»µ½ schedule.py£º$scriptPath"
     exit 1
 }
 

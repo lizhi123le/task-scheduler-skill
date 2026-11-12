@@ -5,6 +5,7 @@ description: |
 
   中文关键词: 定时任务、任务调度、cron替代、自动化任务、计划任务、任务管理、定时执行、任务监控、crontab、Task Scheduler、任务依赖、失败重试、Windows通知
   English Keywords: Scheduled task, Task scheduling, Cron job, Automation, Planned task
+disable-model-invocation: false
 ---
 
 # Task Scheduler v2.0 - 跨平台定时任务管理器
@@ -343,6 +344,8 @@ CREATE TABLE execution_logs (
 | `logs` | 查看日志 | `schedule.py logs --task "名称"` |
 | `export` | 导出配置 | `schedule.py export config.json` |
 | `import` | 导入配置 | `schedule.py import config.json` |
+| `repair` | 按数据库重建/校正系统任务（被误删后一键恢复） | `schedule.py repair --dry-run` |
+| `renumber` | 序号压实为 1..N 连续（系统任务名同步改名） | `schedule.py renumber --dry-run` |
 
 ## 跨平台支持
 
@@ -379,6 +382,24 @@ CREATE TABLE execution_logs (
    - `schtasks /Create` 默认给的是 `True/True/False`（用电池不启动、切电池杀进程、错过不补跑），
      笔记本睡眠/拔电场景下就会表现为"没定期执行"；`schedule.py enable <名称>` 会重新修正这三项
    - 任务默认只在用户登录时运行（Interactive），要在未登录时也跑需要额外的凭据配置
+
+### 系统任务被删掉（杀毒 / 清理软件隔离）
+- 症状：`schedule list` 里任务还在，但任务计划程序里 `TaskScheduler-<id>-*` 不见了，到点不跑
+- 一条命令按数据库重建：`schedule repair`
+- 先看差异不落盘：`schedule repair --dry-run`（检测到不一致时退出码为 1）
+- 只修某一条：`schedule repair --task "任务名"`
+- 清理系统里已无数据库记录的孤儿实体：`schedule repair --prune`
+- 判定规则：实体缺失 / 入口命令不符 / 触发器与库里调度不一致 → 整条重建；
+  只有电源设置或启用状态不符 → 原地修正（保留历史与统计）
+- 重建时用库里的 `next_run` 作网格锚点，保住"每 N 天"任务的相位，不会被挪到今天
+
+### 序号想从 1 开始连续
+- 一条命令压实：`schedule renumber`（保持现有顺序，把 id 改成 1..N）
+- 先看不改：`schedule renumber --dry-run`
+- `remove` 默认删除后自动压实（否则"序号 = 第几条"的直觉会失效）；想保留原号加 `--no-renumber`
+- Windows 侧优先原地改名（`Register-ScheduledTask -InputObject`），StartBoundary / Repetition / 运行历史都保留；改名失败才退回按库重建
+- 库侧用两阶段置换（先改负数占位再落终值），避免主键冲突时被 `INSERT OR REPLACE` 静默删行
+- 改完会把 `id_counter` 对齐到 N，下一次 `add` 从 N+1 接着来
 
 ### Windows 通知不显示
 - 确保 PowerShell 可用

@@ -45,6 +45,7 @@ from enum import Enum
 import threading
 import traceback
 import calendar
+import copy
 
 # Windows 编码修复
 if sys.platform == 'win32':
@@ -151,38 +152,106 @@ class SafePrint:
         SafePrint.print(f"[INFO] {msg}")
 
 
+_WIN_GUI_LAUNCHERS = ("wscript", "cscript", "mshta")
+
+
+def split_win_command(command: str):
+    """按 Windows 命令行习惯切分命令（保留引号内空格，剥掉外层引号）。"""
+    import re
+    tokens = re.findall(r'"[^"]*"|\'[^\']*\'|\S+', command)
+    out = []
+    for t in tokens:
+        if len(t) >= 2 and t[0] == t[-1] and t[0] in ('"', "'"):
+            t = t[1:-1]
+        out.append(t)
+    return out
+
+
+def gui_launcher_argv(command: str):
+    """命令若只是启动一个 GUI 子系统程序（wscript/cscript/mshta），返回 argv。
+
+    Windows 上这类命令既不需要 shell 解析，也不需要 task_utf8_wrapper 的
+    python.exe + cmd.exe 中转：那条链路即使加了 CREATE_NO_WINDOW，仍会创建
+    隐藏控制台 + conhost，在部分机器上会出现一闪而过的窗口。直接以
+    CREATE_NO_WINDOW 启动 GUI 可执行文件，屏幕上不会有任何窗口出现。
+
+    返回 None 表示不是这类命令，调用方继续走原来的 wrapper 路径。
+    """
+    if sys.platform != 'win32':
+        return None
+    try:
+        argv = split_win_command(command)
+    except Exception:
+        return None
+    if len(argv) < 2:
+        return None
+    base = argv[0].strip().lower().rsplit('\\', 1)[-1]
+    if base.endswith('.exe'):
+        base = base[:-4]
+    if base not in _WIN_GUI_LAUNCHERS:
+        return None
+    return argv
+
+
 class WindowsNotifier:
-    """Windows 原生通知"""
+    """Windows 原生通知
+
+    重要：schedule.py 由 pythonw.exe / 计划任务启动时**没有控制台**。此时用
+    subprocess 起 powershell.exe（控制台子系统程序）而不加 CREATE_NO_WINDOW，
+    Windows 会为它分配一个新的控制台 —— 在 Win11 默认终端下就是一个实实在在
+    弹出的 Windows Terminal 窗口（实测每 5 分钟的守护任务都会弹一次，因为脚本里
+    还有 Start-Sleep 6，窗口会停留好几秒）。因此这里必须用「完全无窗口」方式启动。
+    """
+    @staticmethod
+    def _hidden_kwargs():
+        """无窗口启动子进程所需的参数（仅 Windows 有效）"""
+        kw = {}
+        if sys.platform == 'win32':
+            if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+                kw['creationflags'] = subprocess.CREATE_NO_WINDOW
+            if hasattr(subprocess, 'STARTUPINFO'):
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = 0  # SW_HIDE
+                kw['startupinfo'] = si
+        return kw
+
     @staticmethod
     def notify(title: str, message: str, icon_type: str = "info"):
-        """发送 Windows 通知"""
+        """发送 Windows 通知（不产生任何窗口）"""
         if sys.platform != 'win32':
             return
         
         try:
-            # 使用 PowerShell 发送通知
-            icon_map = {
-                "info": "Information",
-                "warning": "Warning",
-                "error": "Error"
-            }
-            icon = icon_map.get(icon_type, "Information")
-            
+            # SystemIcons 与 ToolTipIcon 的枚举名不同：
+            # SystemIcons = Information|Warning|Error，ToolTipIcon = Info|Warning|Error。
+            # 旧代码把 "Information" 传给 ToolTipIcon，PowerShell 直接抛错，气泡其实没弹出来。
+            sys_icon = {"info": "Information", "warning": "Warning", "error": "Error"}
+            tip_icon = {"info": "Info", "warning": "Warning", "error": "Error"}
+            icon = sys_icon.get(icon_type, "Information")
+            tip = tip_icon.get(icon_type, "Info")
+
+            # PowerShell 单引号字符串：内部单引号写两遍，避免标题/正文里的引号把脚本截断
+            def _ps(text) -> str:
+                return "'" + str(text).replace("'", "''") + "'"
+
             ps_script = f'''
 Add-Type -AssemblyName System.Windows.Forms
 $notify = New-Object System.Windows.Forms.NotifyIcon
 $notify.Icon = [System.Drawing.SystemIcons]::{icon}
 $notify.Visible = $true
-$notify.ShowBalloonTip(5000, "{title}", "{message}", [System.Windows.Forms.ToolTipIcon]::{icon})
+$notify.ShowBalloonTip(5000, {_ps(title)}, {_ps(message)}, [System.Windows.Forms.ToolTipIcon]::{tip})
 Start-Sleep -Seconds 6
 $notify.Dispose()
 '''
             subprocess.run(
-                ["powershell", "-Command", ps_script],
+                ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+                 "-Command", ps_script],
                 capture_output=True,
-                timeout=10,
+                timeout=15,
                 encoding='utf-8',
-                errors='replace'
+                errors='replace',
+                **WindowsNotifier._hidden_kwargs()
             )
         except Exception as e:
             SafePrint.warn(f"通知发送失败: {e}")
@@ -322,6 +391,34 @@ class DatabaseManager:
                 return cursor.rowcount > 0
         except Exception as e:
             SafePrint.error(f"删除任务失败: {e}")
+            return False
+    
+    def renumber_ids(self, mapping: Dict[int, int]) -> bool:
+        """按 {旧id: 新id} 重写 tasks.id 与 execution_logs.task_id。
+
+        必须两阶段：先把所有要挪的行改成负数占位，再统一落最终值。
+        直接 `UPDATE tasks SET id=新 WHERE id=旧` 会在"目标号还被别人占着"
+        时撞主键（例如 3->2 而 2 尚未腾出）；而 tasks.name 是 UNIQUE，
+        用 INSERT OR REPLACE 绕过主键冲突会顺手删掉另一行 —— 会静默丢任务。
+        负数占位不占用任何正号，因此能安全地做原地置换。
+        """
+        moves = {old: new for old, new in mapping.items() if old != new}
+        if not moves:
+            return True
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                for old in moves:
+                    cursor.execute('UPDATE tasks SET id = -? WHERE id = ?', (old, old))
+                for old, new in moves.items():
+                    cursor.execute('UPDATE tasks SET id = ? WHERE id = -?', (new, old))
+                for old, new in moves.items():
+                    cursor.execute(
+                        'UPDATE execution_logs SET task_id = ? WHERE task_id = ?', (new, old))
+                conn.commit()
+                return True
+        except Exception as e:
+            SafePrint.error(f"重编号写库失败: {e}")
             return False
     
     def log_execution(self, task_id: int, task_name: str, status: str,
@@ -466,6 +563,9 @@ class TaskScheduler:
         """
         if self.platform != Platform.WINDOWS:
             return None
+        if task.schedule_type == "startup":
+            # ONLOGON 触发器没有 StartBoundary 网格，交给 Windows 自己决定
+            return None
         task_name = f"TaskScheduler-{task.id}-{task.name.replace(' ', '_')}"
         try:
             r = subprocess.run(['schtasks', '/Query', '/TN', task_name, '/XML'],
@@ -507,6 +607,10 @@ class TaskScheduler:
         now = datetime.now()
         
         try:
+            if task.schedule_type == "startup":
+                # 开机/登录触发没有日历网格，无法推算具体时间点
+                return None
+
             if task.schedule_type == "hourly":
                 next_run = now + timedelta(hours=1)
                 return next_run.replace(second=0, microsecond=0).isoformat()
@@ -645,10 +749,20 @@ class TaskScheduler:
             SafePrint.error(f"系统调度器设置失败: {e}")
             return False
     
-    def _setup_windows_task(self, task: Task) -> bool:
-        """设置 Windows Task Scheduler"""
+    def _setup_windows_task(self, task: Task, anchor: Optional[datetime] = None,
+                            sync_db: bool = True) -> bool:
+        """设置 Windows Task Scheduler
+
+        anchor：可选的网格锚点。重建任务时传入库里记录的下次执行时间，
+        就能保住“每 N 天”任务的相位（否则 StartBoundary 会被重置成今天，
+        14 天体检之类的任务会被整体挪走）。
+
+        sync_db：是否在建好后把 Windows 网格回填进库。renumber 期间必须传
+        False —— 那时库里还是旧 id，回填会按新 id 再插一行（name 唯一，
+        INSERT OR REPLACE 会顺手删掉旧行），造成"序号还没改、行先丢了"。
+        """
         try:
-            task_name = f"TaskScheduler-{task.id}-{task.name.replace(' ', '_')}"
+            task_name = self._windows_task_name(task)
             
             # 删除已存在的任务
             subprocess.run(['schtasks', '/Delete', '/TN', task_name, '/F'],
@@ -660,7 +774,8 @@ class TaskScheduler:
                 'daily': ['/SC', 'DAILY'],
                 'every_days': ['/SC', 'DAILY'],
                 'weekly': ['/SC', 'WEEKLY'],
-                'monthly': ['/SC', 'MONTHLY']
+                'monthly': ['/SC', 'MONTHLY'],
+                'startup': ['/SC', 'ONLOGON']
             }
             
             if task.schedule_type == 'interval':
@@ -689,21 +804,12 @@ class TaskScheduler:
                 parts = task.schedule_value.split()
                 day = parts[0]
                 cmd_parts.extend(['/D', day, '/ST', parts[1]])
+            elif task.schedule_type == 'startup':
+                # 登录后延迟 10 秒再拉起：等网络栈与用户 PATH（node）就绪
+                cmd_parts.extend(['/DELAY', '0000:10'])
             
-            # 构建执行命令
-            # 用 pythonw.exe（无控制台）而非 python.exe：计划任务由 Task Scheduler
-            # 启动时没有控制台，python.exe 会弹出一个命令窗口并在任务执行期间一直
-            # 亮着。pythonw 是无窗口解释器，配合 SafePrint 对 stdout=None 的兜底，
-            # 执行期不再出现窗口。
-            # 【注意】pythonw 下 sys.executable 也是 pythonw.exe，会让子进程一并变成
-            # 无窗口进程而丢失管道输出 —— 故 _execute_task 里另有"子进程强制用
-            # python.exe"的处理，见该处注释。
-            # 找不到 pythonw 时回退 python.exe（仅美观受影响）。
-            python_exe = sys.executable
-            pythonw_exe = Path(python_exe).with_name("pythonw.exe")
-            launcher_exe = str(pythonw_exe) if pythonw_exe.exists() else python_exe
-            script_path = Path(__file__).resolve()
-            run_cmd = f'"{launcher_exe}" "{script_path}" internal-run {task.id}'
+            # 构建执行命令：入口只应有一处定义，统一交给 _windows_run_cmd
+            run_cmd = self._windows_run_cmd(task)
             
             cmd_parts.extend(['/TR', run_cmd, '/F'])
             
@@ -712,12 +818,15 @@ class TaskScheduler:
             
             if result.returncode == 0:
                 SafePrint.success(f"Windows Task Scheduler 任务已创建: {task_name}")
+                # 先钉网格相位，再改电源设置（后者会 Set-ScheduledTask，顺序无关但先做更直观）
+                if anchor is not None:
+                    self._set_windows_start_boundary(task_name, anchor)
                 # schtasks 会继承 Windows 默认设置（用电池不启动、错过不补跑），
                 # 必须显式改写，否则任务会"已启用但到点不执行"
                 self._apply_windows_task_settings(task_name, enabled=(task.status == "active"))
                 # 让 DB 的 next_run 对齐 Windows 权威网格（StartBoundary + DaysInterval）。
                 # 用 created_at 推算会与系统差一天（整点锚点 vs 带时分秒的创建时刻）。
-                if self._sync_next_run_with_windows(task):
+                if sync_db and self._sync_next_run_with_windows(task):
                     SafePrint.info(f"next_run 已按 Windows 网格校准为 {task.next_run}")
                 return True
             else:
@@ -826,6 +935,458 @@ class TaskScheduler:
         )
         return False
     
+    # ---------------- 自检 / 修复（系统任务被误删后一键重建） ----------------
+
+    def _windows_task_name(self, task: Task) -> str:
+        """系统任务实体名。把库里的 id 编进名字，才能反查出「这条实体属于谁」。"""
+        return f"TaskScheduler-{task.id}-{task.name.replace(' ', '_')}"
+
+    def _windows_run_cmd(self, task: Task) -> str:
+        """计划任务里存的唯一入口：pythonw schedule.py internal-run <id>
+
+        用 pythonw.exe（无控制台）而非 python.exe：计划任务由 Task Scheduler
+        启动时没有控制台，python.exe 会弹出一个命令窗口并在任务执行期间一直
+        亮着。找不到 pythonw 时回退 python.exe（仅美观受影响）。
+
+        【注意】pythonw 下 sys.executable 也是 pythonw.exe，会让子进程一并变成
+        无窗口进程而丢失管道输出 —— 故 _execute_task 里另有"子进程强制用
+        python.exe"的处理。
+
+        业务命令只存在数据库里，系统任务只记 id：换脚本路径、改命令都不必动
+        Windows 侧，`repair` 也能据此判断实体是否过期。
+        """
+        python_exe = sys.executable
+        pythonw_exe = Path(python_exe).with_name("pythonw.exe")
+        launcher_exe = str(pythonw_exe) if pythonw_exe.exists() else python_exe
+        script_path = Path(__file__).resolve()
+        return f'"{launcher_exe}" "{script_path}" internal-run {task.id}'
+
+    @staticmethod
+    def _norm_cmd(s: str) -> str:
+        """比较入口命令时忽略大小写、引号与空白差异（schtasks 会重排空格）。"""
+        return re.sub(r"\s+", " ", (s or "").replace('"', " ")).strip().lower()
+
+    def _query_windows_task(self, task_name: str) -> Optional[Dict[str, str]]:
+        """读取系统任务现状；不存在返回 None。
+
+        只解析 ASCII 字段（时间/命令/设置），不碰中文名称，避开控制台编码坑。
+        """
+        r = subprocess.run(['schtasks', '/Query', '/TN', task_name, '/XML'],
+                           capture_output=True, encoding='utf-8', errors='replace')
+        if r.returncode != 0 or not (r.stdout or "").strip():
+            return None
+        xml = r.stdout
+
+        def grab(pattern: str, default: str = "") -> str:
+            m = re.search(pattern, xml)
+            return m.group(1) if m else default
+
+        return {
+            "command": grab(r"<Command>([^<]*)</Command>"),
+            "arguments": grab(r"<Arguments>([^<]*)</Arguments>"),
+            "start_boundary": grab(r"<StartBoundary>([^<]*)</StartBoundary>"),
+            "days_interval": grab(r"<DaysInterval>(\d+)</DaysInterval>"),
+            "dib": grab(r"<DisallowStartIfOnBatteries>([^<]*)</DisallowStartIfOnBatteries>").lower(),
+            "sib": grab(r"<StopIfGoingOnBatteries>([^<]*)</StopIfGoingOnBatteries>").lower(),
+            "swa": grab(r"<StartWhenAvailable>([^<]*)</StartWhenAvailable>").lower(),
+            "mip": grab(r"<MultipleInstancesPolicy>([^<]*)</MultipleInstancesPolicy>"),
+        }
+
+    def _query_windows_state(self, task_name: str) -> str:
+        """取任务状态（Ready/Running/Disabled）；读不到返回空串。
+
+        不用 schtasks 的 Status 字段：它是本地化文本（中文系统上是“已禁用”），
+        而 Get-ScheduledTask 返回枚举名，跨语言环境稳定。
+        """
+        safe = task_name.replace("'", "''")
+        ps = ("$ErrorActionPreference='Stop';"
+              f"$t = Get-ScheduledTask -TaskName '{safe}';"
+              "[string]$t.State")
+        try:
+            r = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
+                               capture_output=True, text=True, encoding='utf-8', errors='replace')
+        except FileNotFoundError:
+            return ""
+        if r.returncode != 0:
+            return ""
+        out = (r.stdout or "").strip()
+        return out.splitlines()[-1].strip() if out else ""
+
+    def _set_windows_start_boundary(self, task_name: str, anchor: datetime) -> bool:
+        """把触发器 StartBoundary 钉到指定时间，保住“每 N 天”的相位。
+
+        不用 schtasks /SD：它按本地化日期格式解析，中文系统上 MM/DD/YYYY 会翻车；
+        PowerShell 直接写 ISO 时间，跨语言环境一致。写完回读校验。
+        """
+        safe = task_name.replace("'", "''")
+        iso = anchor.strftime("%Y-%m-%dT%H:%M:%S")
+        ps = ("$ErrorActionPreference='Stop';"
+              f"$n = '{safe}';"
+              "$t = Get-ScheduledTask -TaskName $n;"
+              f"$t.Triggers[0].StartBoundary = '{iso}';"
+              "Set-ScheduledTask -TaskName $n -Trigger $t.Triggers | Out-Null;"
+              "(Get-ScheduledTask -TaskName $n).Triggers[0].StartBoundary")
+        try:
+            r = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
+                               capture_output=True, text=True, encoding='utf-8', errors='replace')
+        except FileNotFoundError:
+            SafePrint.warn("未找到 powershell，无法校准触发时间")
+            return False
+        out = (r.stdout or "").strip()
+        got = out.splitlines()[-1].strip() if out else ""
+        if got.startswith(iso):
+            return True
+        SafePrint.warn(f"触发时间校准失败: 期望 {iso}，实际 {got or '?'}"
+                       + (f" | {(r.stderr or '').strip()}" if r.returncode != 0 else ""))
+        return False
+
+    def _repair_anchor(self, task: Task) -> Optional[datetime]:
+        """用库里 next_run 反推一个不早于现在的网格锚点。
+
+        只对日历型调度有意义：daily 用当天/明天，every_days 按 DaysInterval 递推。
+        startup/hourly/interval 没有日历网格，返回 None 交给系统自己排。
+        """
+        if task.schedule_type not in ("daily", "every_days", "weekly", "monthly"):
+            return None
+        if not task.next_run:
+            return None
+        try:
+            anchor = datetime.fromisoformat(task.next_run)
+        except ValueError:
+            return None
+        now = datetime.now()
+        if task.schedule_type == "every_days":
+            try:
+                step = max(1, int(task.schedule_value.split("|")[0]))
+            except (ValueError, IndexError):
+                step = 1
+            while anchor <= now:
+                anchor += timedelta(days=step)
+        if anchor <= now:
+            return None
+        return anchor
+
+    def _windows_task_problems(self, task: Task, info: Dict[str, str],
+                               state: str) -> Tuple[List[str], List[str]]:
+        """把系统实体与数据库对不上的地方分类：需整条重建 / 只需改设置。"""
+        rebuild: List[str] = []
+        fix: List[str] = []
+
+        want_cmd = self._windows_run_cmd(task)
+        actual_cmd = f"{info.get('command', '')} {info.get('arguments', '')}".strip()
+        if self._norm_cmd(actual_cmd) != self._norm_cmd(want_cmd):
+            rebuild.append("入口命令不符")
+
+        sb = info.get("start_boundary", "")
+        got_time = sb[11:16] if len(sb) >= 16 else ""
+        if task.schedule_type == "daily":
+            if got_time != task.schedule_value.strip():
+                rebuild.append(f"触发时间 {got_time or '?'} != {task.schedule_value.strip()}")
+        elif task.schedule_type == "every_days":
+            try:
+                days_part, time_part = task.schedule_value.split("|")
+            except ValueError:
+                days_part, time_part = "1", ""
+            if (info.get("days_interval") or "") != str(days_part):
+                rebuild.append(f"间隔 {info.get('days_interval') or '?'} 天 != {days_part}")
+            if time_part and got_time != time_part:
+                rebuild.append(f"触发时间 {got_time or '?'} != {time_part}")
+        elif task.schedule_type in ("weekly", "monthly"):
+            parts = task.schedule_value.split()
+            if len(parts) == 2 and got_time != parts[1]:
+                rebuild.append(f"触发时间 {got_time or '?'} != {parts[1]}")
+        # startup(ONLOGON) 没有日历网格，不校验时间
+
+        if info.get("dib") != "false":
+            fix.append(f"DisallowStartIfOnBatteries={info.get('dib') or '?'}")
+        if info.get("sib") != "false":
+            fix.append(f"StopIfGoingOnBatteries={info.get('sib') or '?'}")
+        if info.get("swa") != "true":
+            fix.append(f"StartWhenAvailable={info.get('swa') or '?'}")
+        if info.get("mip") != "IgnoreNew":
+            fix.append(f"MultipleInstancesPolicy={info.get('mip') or '?'}")
+
+        if state:
+            if task.status == "active" and state == "Disabled":
+                fix.append("系统里是 Disabled，但库里是 active")
+            elif task.status != "active" and state != "Disabled":
+                fix.append(f"系统里是 {state}，但库里是 paused")
+        return rebuild, fix
+
+    def _windows_orphan_ids(self) -> List[int]:
+        """系统里存在、数据库里已经没有的 TaskScheduler-<id>-* 的 id。
+
+        只按 ASCII 前缀 `TaskScheduler-<数字>-` 匹配，不依赖中文名称解码。
+        """
+        known = {t.id for t in self.tasks}
+        r = subprocess.run(['schtasks', '/Query', '/FO', 'CSV', '/NH'],
+                           capture_output=True, encoding='utf-8', errors='replace')
+        ids = set()
+        for line in (r.stdout or "").splitlines():
+            m = re.search(r"TaskScheduler-(\d+)-", line)
+            if m and int(m.group(1)) not in known:
+                ids.add(int(m.group(1)))
+        return sorted(ids)
+
+    def _windows_delete_tasks_by_ids(self, ids: List[int]) -> bool:
+        """按 id 删除孤儿实体。在 PowerShell 里完成匹配与删除，避免名称回传的编码问题。"""
+        if not ids:
+            return True
+        ps = ("$ids = @(" + ",".join(str(i) for i in ids) + ");"
+              "Get-ScheduledTask -TaskName 'TaskScheduler-*' -ErrorAction SilentlyContinue |"
+              " Where-Object { $m = [regex]::Match($_.TaskName,'^TaskScheduler-([0-9]+)-');"
+              " $m.Success -and ($ids -contains [int]$m.Groups[1].Value) } |"
+              " Unregister-ScheduledTask -Confirm:$false")
+        try:
+            r = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
+                               capture_output=True, text=True, encoding='utf-8', errors='replace')
+        except FileNotFoundError:
+            return False
+        return r.returncode == 0
+
+    @staticmethod
+    def _print_repair_table(rows: List[Tuple[str, str, str]]):
+        SafePrint.print("\n" + "=" * 84)
+        SafePrint.print(f"{'任务':<26}{'结果':<12}说明")
+        SafePrint.print("-" * 84)
+        for name, action, detail in rows:
+            SafePrint.print(f"{name:<26}{action:<12}{detail}")
+        SafePrint.print("=" * 84)
+
+    def repair_tasks(self, dry_run: bool = False, prune: bool = False,
+                     only: Optional[str] = None) -> bool:
+        """按数据库重建/校正系统计划任务（杀毒误删后的一键恢复）。
+
+        判定规则：
+        - 实体缺失、入口命令不符、触发器与库里调度对不上 → 整条重建
+        - 只有电源/补偿设置或启用状态不符 → 原地修正，不重建（保留历史与统计）
+        - 库里没有对应记录的孤儿实体 → 默认只报告，--prune 才删
+        """
+        targets = [t for t in self.tasks if not only or t.name == only]
+        if only and not targets:
+            SafePrint.error(f"任务 '{only}' 不存在")
+            return False
+
+        rows: List[Tuple[str, str, str]] = []
+        all_ok = True
+
+        if self.platform != Platform.WINDOWS:
+            for task in targets:
+                if dry_run:
+                    rows.append((task.name, "跳过", "非 Windows 平台，未检查"))
+                    continue
+                ok = self._setup_system_scheduler(task)
+                rows.append((task.name, "已重建" if ok else "失败", "" if ok else "系统调度器设置失败"))
+                all_ok = all_ok and ok
+            self._print_repair_table(rows)
+            return all_ok
+
+        for task in targets:
+            tname = self._windows_task_name(task)
+            info = self._query_windows_task(tname)
+
+            if info is None:
+                if dry_run:
+                    rows.append((task.name, "将重建", "系统里不存在"))
+                    all_ok = False
+                    continue
+                ok = self._setup_windows_task(task, anchor=self._repair_anchor(task))
+                rows.append((task.name, "已重建" if ok else "失败",
+                             "系统里不存在" if ok else "重建失败，见上方错误"))
+                all_ok = all_ok and ok
+                continue
+
+            state = self._query_windows_state(tname)
+            rebuild, fix = self._windows_task_problems(task, info, state)
+
+            if rebuild:
+                if dry_run:
+                    rows.append((task.name, "将重建", "；".join(rebuild)))
+                    all_ok = False
+                    continue
+                ok = self._setup_windows_task(task, anchor=self._repair_anchor(task))
+                rows.append((task.name, "已重建" if ok else "失败", "；".join(rebuild)))
+                all_ok = all_ok and ok
+                continue
+
+            if fix:
+                if dry_run:
+                    rows.append((task.name, "将修正", "；".join(fix)))
+                    all_ok = False
+                    continue
+                ok = self._apply_windows_task_settings(tname, enabled=(task.status == "active"))
+                rows.append((task.name, "已修正" if ok else "失败", "；".join(fix)))
+                all_ok = all_ok and ok
+                continue
+
+            if not dry_run:
+                self._sync_next_run_with_windows(task)
+            rows.append((task.name, "正常", ""))
+
+        orphan_ids = self._windows_orphan_ids()
+        for oid in orphan_ids:
+            label = f"TaskScheduler-{oid}-*"
+            if prune and not dry_run:
+                ok = self._windows_delete_tasks_by_ids([oid])
+                rows.append((label, "已删孤儿" if ok else "删除失败", "系统里有、库里没有"))
+                all_ok = all_ok and ok
+            else:
+                rows.append((label, "孤儿", "系统里有、库里没有（--prune 可删）"))
+
+        self._print_repair_table(rows)
+        return all_ok
+
+    # ---------------- 序号压实（1..N 连续，系统实体同步改名） ----------------
+
+    def _set_id_counter(self, value: int) -> bool:
+        """把 id 高水位线写回 value，让下一次 add 接着 N+1，不会又跳号。"""
+        counter_file = self.config_dir / "id_counter"
+        try:
+            tmp = counter_file.with_suffix(".tmp")
+            tmp.write_text(str(value), encoding="utf-8")
+            os.replace(tmp, counter_file)
+            return True
+        except OSError as e:
+            SafePrint.warn(f"无法写入 id 高水位线({e})")
+            return False
+
+    def _rename_windows_task(self, old_id: int, new_id: int) -> bool:
+        """把系统实体的序号 old_id 改成 new_id，保留触发器/设置/运行历史。
+
+        为什么不"删除+重建"：重建会把 StartBoundary 重置到今天的网格，还会
+        丢掉 Repetition 之类的开关（"登录自启"那条正挂着每 10 分钟的重复触发）。
+        这里用 Register-ScheduledTask -InputObject 原样搬运实体，只把动作里的
+        `internal-run <旧id>` 改写成新 id。
+
+        实体按 `TaskScheduler-<id>-*` 前缀匹配，不把中文任务名拼进 PowerShell
+        脚本：-Command 传中文有编码坑，脚本保持纯 ASCII 最稳。
+        """
+        ps = (
+            "$ErrorActionPreference='Stop';"
+            f"$old = (Get-ScheduledTask -TaskName 'TaskScheduler-{old_id}-*' "
+            "-ErrorAction SilentlyContinue | Select-Object -First 1).TaskName;"
+            "if (-not $old) { 'NOMATCH'; exit 0 };"
+            f"$new = 'TaskScheduler-{new_id}-' + ($old -replace '^TaskScheduler-{old_id}-','');"
+            "$t = Get-ScheduledTask -TaskName $old;"
+            "if (-not $t.Actions -or $t.Actions.Count -lt 1) { 'NOACTION'; exit 0 };"
+            f"$t.Actions[0].Arguments = ($t.Actions[0].Arguments -replace "
+            f"'internal-run\\s+{old_id}\\s*$','internal-run {new_id}');"
+            "Register-ScheduledTask -TaskName $new -InputObject $t -Force | Out-Null;"
+            "Unregister-ScheduledTask -TaskName $old -Confirm:$false;"
+            "'OK'"
+        )
+        try:
+            r = subprocess.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', ps],
+                               capture_output=True, text=True, encoding='utf-8', errors='replace')
+        except FileNotFoundError:
+            SafePrint.warn("未找到 powershell，无法改名系统任务")
+            return False
+        out = (r.stdout or "").strip()
+        last = out.splitlines()[-1].strip() if out else ""
+        if last == "OK":
+            return True
+        detail = last or (r.stderr or "").strip()[:200] or f"rc={r.returncode}"
+        SafePrint.warn(f"系统任务改名失败(TaskScheduler-{old_id}-* -> {new_id}): {detail}")
+        return False
+
+    @staticmethod
+    def _print_renumber_table(rows: List[Tuple[str, str, str]], header: str = ""):
+        SafePrint.print("\n" + "=" * 64)
+        SafePrint.print(f"{header:<10}{'任务':<28}{'序号':<16}")
+        SafePrint.print("-" * 64)
+        for name, change, note in rows:
+            SafePrint.print(f"{'':<10}{name:<28}{change:<16}{note}")
+        SafePrint.print("=" * 64)
+
+    def renumber_tasks(self, dry_run: bool = False, quiet: bool = False) -> bool:
+        """把序号压实成 1..N（保持现有相对顺序，从 1 开始连续）。
+
+        三件事必须一起做，否则 id 与系统实体就会错位：
+        1) 系统侧把 `TaskScheduler-<旧id>-<名称>` 改成新号，并改写动作里的
+           `internal-run <id>`；
+        2) 库里改写 tasks.id 与 execution_logs.task_id（历史日志跟着走）；
+        3) 重置 id 高水位线到 N，下一次 add 从 N+1 继续。
+
+        顺序是"系统先、库后"：改名失败或重建失败时整体回滚，库保持原样，
+        绝不会出现"库和系统实体各说各话"。Windows 侧优先原地改名（保相位），
+        改名失败才退回按库重建。
+        """
+        ordered = sorted(self.tasks, key=lambda t: t.id)
+        mapping = {t.id: idx for idx, t in enumerate(ordered, start=1)}
+        moves = [(t, mapping[t.id]) for t in ordered if t.id != mapping[t.id]]
+
+        if not moves:
+            # 没有要挪的行，但高水位可能还停在更大的旧号上（删掉尾号就会这样）：
+            # 一并对齐到 N，否则下一次 add 从 N+2 起跳，立刻又出现空号。
+            self._set_id_counter(len(ordered))
+            if not quiet:
+                SafePrint.info(f"序号已经连续（1..{len(ordered)}），id 高水位已对齐")
+            return True
+
+        rows = [(t.name, f"{t.id} -> {nid}", "") for t, nid in moves]
+        if dry_run:
+            self._print_renumber_table(rows, "将调整")
+            return True
+
+        done: List[Tuple[int, int]] = []
+        failure: Optional[str] = None
+
+        if self.platform == Platform.WINDOWS:
+            for task, nid in moves:
+                if self._rename_windows_task(task.id, nid):
+                    done.append((task.id, nid))
+                    continue
+                SafePrint.warn(f"{task.name}: 原地改名失败，改为按库重建实体")
+                tmp = copy.copy(task)
+                tmp.id = nid
+                if self._setup_windows_task(tmp, anchor=self._repair_anchor(task), sync_db=False):
+                    subprocess.run(['schtasks', '/Delete', '/TN', self._windows_task_name(task), '/F'],
+                                   capture_output=True, encoding='utf-8', errors='replace')
+                    done.append((task.id, nid))
+                else:
+                    failure = f"{task.name}: 改名与重建均失败"
+                    break
+
+            if failure:
+                for old_id, nid in reversed(done):
+                    if not self._rename_windows_task(nid, old_id):
+                        SafePrint.error(
+                            f"回滚失败: TaskScheduler-{nid}-* 仍指向新号，"
+                            f"请运行 `schedule repair` 按库校准")
+                SafePrint.error(f"序号调整已中止（数据库未改）: {failure}")
+                return False
+        else:
+            for task, nid in moves:
+                tmp = copy.copy(task)
+                tmp.id = nid
+                self._remove_system_scheduler(task)
+                self._setup_system_scheduler(tmp)
+                done.append((task.id, nid))
+
+        if not self.db.renumber_ids(mapping):
+            SafePrint.error("数据库改写失败，系统侧已改名的实体需修复：`schedule repair`")
+            return False
+        self._set_id_counter(len(ordered))
+        self._load_tasks()
+
+        if not quiet:
+            self._print_renumber_table(rows, "已调整")
+            SafePrint.success(f"序号已压实为 1..{len(ordered)}")
+
+        if self.platform == Platform.WINDOWS:
+            bad = []
+            for task in self.tasks:
+                info = self._query_windows_task(self._windows_task_name(task))
+                if info is None:
+                    bad.append(f"{task.name}(实体缺失)")
+                elif not re.search(rf"internal-run\s+{task.id}\s*$",
+                                   info.get("arguments", "") or ""):
+                    bad.append(f"{task.name}(动作仍指向别的 id)")
+            if bad:
+                SafePrint.warn("重编号后系统侧校验未通过: " + "；".join(bad)
+                               + "（运行 `schedule repair` 可修正）")
+        return True
+
     def _setup_macos_task(self, task: Task) -> bool:
         """设置 macOS launchd（修复时间硬编码）"""
         try:
@@ -875,6 +1436,15 @@ class TaskScheduler:
     <integer>{hour}</integer>
     <key>Minute</key>
     <integer>{minute}</integer>'''
+
+            # 开机/登录触发没有日历时间，改用 RunAtLoad（登录即运行）
+            if task.schedule_type == 'startup':
+                schedule_block = '''    <key>RunAtLoad</key>
+    <true/>'''
+            else:
+                schedule_block = f'''    <key>StartCalendarInterval</key>
+    <dict>{interval_xml}
+    </dict>'''
             
             plist_content = f'''<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -889,9 +1459,7 @@ class TaskScheduler:
         <string>internal-run</string>
         <string>{task.id}</string>
     </array>
-    <key>StartCalendarInterval</key>
-    <dict>{interval_xml}
-    </dict>
+    {schedule_block}
     <key>StandardOutPath</key>
     <string>{self.log_dir}/task_{task.id}.out.log</string>
     <key>StandardErrorPath</key>
@@ -966,6 +1534,8 @@ class TaskScheduler:
     
     def _build_cron_expression(self, task: Task) -> str:
         """构建 cron 表达式"""
+        if task.schedule_type == 'startup':
+            return '@reboot'
         if task.schedule_type == 'hourly':
             return '0 * * * *'
         elif task.schedule_type == 'daily':
@@ -988,8 +1558,12 @@ class TaskScheduler:
             return f"{time_parts[1]} {time_parts[0]} {day} * *"
         return '0 2 * * *'
     
-    def remove_task(self, name: str) -> bool:
-        """删除任务"""
+    def remove_task(self, name: str, auto_renumber: bool = True) -> bool:
+        """删除任务
+
+        auto_renumber：删掉中间一条会留下空号，默认顺手压实成 1..N，
+        让 `schedule list` 的序号始终连续（`--no-renumber` 可关闭）。
+        """
         task = next((t for t in self.tasks if t.name == name), None)
         if not task:
             SafePrint.error(f"任务 '{name}' 不存在")
@@ -1005,6 +1579,12 @@ class TaskScheduler:
         
         # 从内存列表移除
         self.tasks.remove(task)
+
+        if auto_renumber:
+            if self.renumber_tasks(quiet=True):
+                SafePrint.info("序号已自动压实为 1..N")
+            else:
+                SafePrint.warn("序号仍有空号，可稍后运行 `schedule renumber`")
         
         return True
     
@@ -1096,6 +1676,9 @@ class TaskScheduler:
                     return False
                 # 旧任务可能仍是"用电池不启动/错过不补跑"的默认设置，一并修正
                 self._apply_windows_task_settings(task_name, enabled=True)
+                # 以 Windows 网格为权威回填 next_run：_calculate_next_run 用的是
+                # created_at 锚点，重建过 StartBoundary 的任务会与系统相位不一致
+                self._sync_next_run_with_windows(task)
             return True
         return False
     
@@ -1168,9 +1751,14 @@ class TaskScheduler:
             
             # 准备执行命令
             # 将命令包装，确保 UTF-8 环境
+            cmd_to_run = None
             if sys.platform == 'win32':
+                # GUI 启动器（wscript/cscript/mshta）：直接执行，不再经
+                # python.exe + cmd.exe 中转，链路上没有任何控制台进程，
+                # 从根上排除"每次触发闪一下窗口"。
+                cmd_to_run = gui_launcher_argv(task.command)
+            if sys.platform == 'win32' and cmd_to_run is None:
                 # 创建临时 wrapper 脚本
-                import tempfile
                 launcher_script = os.path.join(os.path.dirname(__file__), 'task_utf8_wrapper.py')
 
                 # 显式使用有控制台的 python.exe 运行子进程。
@@ -1186,7 +1774,7 @@ class TaskScheduler:
 
                 # 调用 wrapper 脚本执行命令
                 cmd_to_run = [_child_py, launcher_script, task.command]
-            else:
+            elif sys.platform != 'win32':
                 cmd_to_run = task.command
             
             # 执行命令
@@ -1239,11 +1827,12 @@ class TaskScheduler:
                 # 发送通知
                 if not manual:
                     self._send_notification(task, success=True)
-                    WindowsNotifier.notify(
-                        f"任务成功: {task.name}",
-                        f"执行完成，耗时 {duration:.1f} 秒",
-                        "info"
-                    )
+                    if not self._notify_suppressed(task, success=True):
+                        WindowsNotifier.notify(
+                            f"任务成功: {task.name}",
+                            f"执行完成，耗时 {duration:.1f} 秒",
+                            "info"
+                        )
                 
                 self.db.save_task(task)
                 return True
@@ -1270,11 +1859,12 @@ class TaskScheduler:
                 # 发送失败通知
                 if not manual:
                     self._send_notification(task, success=False, error=error)
-                    WindowsNotifier.notify(
-                        f"任务失败: {task.name}",
-                        f"失败 {task.fail_count} 次，请检查日志",
-                        "error"
-                    )
+                    if not self._notify_suppressed(task, success=False):
+                        WindowsNotifier.notify(
+                            f"任务失败: {task.name}",
+                            f"失败 {task.fail_count} 次，请检查日志",
+                            "error"
+                        )
                 
                 self.db.save_task(task)
                 return False
@@ -1300,6 +1890,24 @@ class TaskScheduler:
             self.db.save_task(task)
             return False
     
+    def _notify_suppressed(self, task: Task, success: bool) -> bool:
+        """按任务开关抑制桌面气泡弹窗（守护类高频任务用）。
+
+        取值来自任务 env_vars 的 TASK_SCHEDULER_SILENT（也可用同名环境变量全局设置）：
+          1 / true / yes / on / all  -> 成功与失败都不弹
+          success / ok               -> 只静默成功，失败仍弹（推荐给守护任务：
+                                        正常运行零打扰，真挂了还能看到提示）
+        """
+        raw = (task.env_vars or {}).get('TASK_SCHEDULER_SILENT')
+        if raw is None:
+            raw = os.environ.get('TASK_SCHEDULER_SILENT')
+        flag = str(raw or '').strip().lower()
+        if flag in ('1', 'true', 'yes', 'on', 'all'):
+            return True
+        if flag in ('success', 'ok') and success:
+            return True
+        return False
+
     def _send_notification(self, task: Task, success: bool, error: str = ""):
         """发送通知"""
         if success and task.notify_on_success:
@@ -1416,6 +2024,8 @@ def format_schedule_str(task: Task) -> str:
         'mon': '周一', 'tue': '周二', 'wed': '周三',
         'thu': '周四', 'fri': '周五', 'sat': '周六', 'sun': '周日'
     }
+    if st == 'startup':
+        return "登录时启动"
     if st == 'daily':
         return f"每天 {sv}"
     if st == 'hourly':
@@ -1577,6 +2187,8 @@ def main():
                            help='间隔执行（如: 30m, 4h, 7d）')
     add_parser.add_argument('--every-days', nargs=2, metavar=('DAYS', 'HH:MM'),
                            help='每隔N天执行（如: 2 12:06）')
+    add_parser.add_argument('--at-startup', action='store_true',
+                           help='开机/登录时执行（Windows: ONLOGON；macOS: RunAtLoad；Linux: @reboot）')
     add_parser.add_argument('--group', help='任务分组')
     add_parser.add_argument('--depends-on', help='依赖的其他任务')
     add_parser.add_argument('--working-dir', help='工作目录')
@@ -1599,6 +2211,8 @@ def main():
     # remove 命令
     remove_parser = subparsers.add_parser('remove', help='删除任务')
     remove_parser.add_argument('name', help='任务名称')
+    remove_parser.add_argument('--no-renumber', action='store_true',
+                               help='删除后不自动压实序号（保留原 id，留下空号）')
     
     # pause 命令
     pause_parser = subparsers.add_parser('pause', help='暂停任务')
@@ -1628,6 +2242,20 @@ def main():
     import_parser = subparsers.add_parser('import', help='导入配置')
     import_parser.add_argument('file', help='输入文件路径')
     
+    # repair 命令
+    repair_parser = subparsers.add_parser(
+        'repair', help='按数据库重建/校正系统计划任务（被杀毒误删后一键恢复）')
+    repair_parser.add_argument('--dry-run', action='store_true', help='只检查不修改')
+    repair_parser.add_argument('--prune', action='store_true',
+                               help='删除系统里没有数据库记录的孤儿任务')
+    repair_parser.add_argument('--task', help='只修复指定任务名称')
+
+    # renumber 命令
+    renumber_parser = subparsers.add_parser(
+        'renumber', help='把任务序号压实为 1..N 连续（系统任务名同步改名）')
+    renumber_parser.add_argument('--dry-run', action='store_true',
+                                 help='只显示将如何调整，不落盘')
+
     # internal-run 命令（内部使用）
     internal_parser = subparsers.add_parser('internal-run', help=argparse.SUPPRESS)
     internal_parser.add_argument('task_id', type=int, help='任务ID')
@@ -1657,7 +2285,10 @@ def main():
         schedule_type = None
         schedule_value = None
         
-        if args.daily:
+        if args.at_startup:
+            schedule_type = "startup"
+            schedule_value = "onlogon"
+        elif args.daily:
             schedule_type = "daily"
             schedule_value = args.daily
         elif args.weekly:
@@ -1676,7 +2307,7 @@ def main():
             schedule_type = "every_days"
             schedule_value = f"{args.every_days[0]}|{args.every_days[1]}"
         else:
-            SafePrint.error("请指定调度时间（--daily, --weekly, --monthly, --hourly, --interval, --every-days）")
+            SafePrint.error("请指定调度时间（--at-startup, --daily, --weekly, --monthly, --hourly, --interval, --every-days）")
             return
         
         # 校验调度时间格式
@@ -1727,7 +2358,7 @@ def main():
         print_tasks_table(tasks)
     
     elif args.command == 'remove':
-        if scheduler.remove_task(args.name):
+        if scheduler.remove_task(args.name, auto_renumber=not args.no_renumber):
             SafePrint.success(f"任务 '{args.name}' 已删除")
     
     elif args.command == 'pause':
@@ -1780,6 +2411,21 @@ def main():
     
     elif args.command == 'import':
         scheduler.import_config(args.file)
+
+    elif args.command == 'repair':
+        ok = scheduler.repair_tasks(dry_run=args.dry_run, prune=args.prune, only=args.task)
+        if ok:
+            SafePrint.success("系统计划任务自检通过")
+        elif args.dry_run:
+            SafePrint.warn("检测到与数据库不一致的项（--dry-run 未做修改）")
+            sys.exit(1)
+        else:
+            SafePrint.error("存在未能修复的项，见上表")
+            sys.exit(1)
+
+    elif args.command == 'renumber':
+        if not scheduler.renumber_tasks(dry_run=args.dry_run):
+            sys.exit(1)
 
 
 if __name__ == '__main__':
