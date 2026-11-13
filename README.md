@@ -105,6 +105,58 @@ active 生效，重建路径也会清空）。
 上限 31 天，持续时间不得小于间隔；`--repeat` 不带值（或 `--clear-repeat`）关闭；
 旧库自动 `ALTER TABLE` 补两列。
 
+### 10. `repair` 擅自写失败重启策略、把"失败"当"暂停"
+
+`load_tasks` 曾用 `row[19] or 3` 读 `retry_count`。`0` 是 `--retry-count 0`（关闭重试）的
+合法取值，却被当成"没设过"抬回默认 3，于是 `schedule repair` 认为任务计划程序里
+"未设置 != 3"，把「设置 → 如果任务失败，尝试重新启动」写成 3 次（VERIFY 里 `RST=PT1M/3`）——
+用户明确关掉的策略被重新打开。同一条命令还有第二处：`status = failed` 只被当成"非 active"，
+`repair` 会把它的系统实体禁用、清掉 `next_run`（日志里还说成"库里是 paused"）。
+
+修法：读库时区分 `0` 与 `NULL`（只有 NULL 才回落默认 3 / 60）；新增 `is_schedulable()`，
+把 `active` / `running` / `failed` 都视为"应保持启用"，`repair` / `_setup_windows_task` /
+`_sync_next_run_with_windows` 统一按它判断，只有 `paused` / `disabled` 才停用。
+回归测试见 `tests/test_repair_rules.py`。
+
+### 11. 「每 N 天」的相位错开一天
+
+`_calculate_next_run` 原先固定按 `created_at` 的日期网格重算 `next_run`。`created_at` 带时分秒，
+而 Windows 的网格锚点是 `StartBoundary`；只要 `update` / `repair` 重钉过 StartBoundary，两边
+网格就错开，算出来的"下一个网格点"会紧贴上次执行 —— 实测「11-13 21:02 刚跑过，下次被算成
+11-14 21:02」，`update` 又把这个错值当锚点钉回系统，越改越偏（每 3 天变成隔天跑）。
+
+修法：给 Task 加 `grid_anchor`（每个「每 N 天」任务显式存网格起点，老库 `ALTER TABLE` 补列、
+按上次执行补值）：
+
+- `_every_days_next_run` 以 `grid_anchor` 为唯一相位来源（依次退回 last_run / next_run /
+  created_at），`_calculate_next_run`、`update` 改调度都走它；
+- `update` 改间隔或时刻时把锚点重置到**上次真正执行那天**，所以「每 3 天」改「每 5 天」，
+  日期从上次执行往后加 5 天（不再只换时分）；只改时分则保持原日期；
+- 手动 `run-now` 不动锚点，测试任务不会把排期挪走；
+- `_execute_task` 执行完按 `StartBoundary + DaysInterval` 回填 `next_run`；
+- `_windows_task_problems` 新增第三类差异 `realign`：日期与网格不符 → `repair` 用
+  `_realign_every_days` 原地重钉 StartBoundary 并回填 `next_run`，不重建实体、保留历史。
+
+### 12. 其它调度类型的时间换算
+
+对齐「每周 / 每月 / 每小时 / 每 N 分钟」时发现三处：
+
+1. **hourly / interval 只跑一次**：`schtasks /SC HOURLY|MINUTE` 用 `TimeTrigger + <Repetition>`
+   实现间隔，而 `_apply_windows_task_settings` 在没有 `--repeat` 时无条件
+   `$tr.Repetition = $null`，把调度本身清掉 —— 任务建好后 `NextRunTime` 为空，跑过一次就停。
+   修法：把 `hourly → 1h`、`interval → schedule_value` 当作"基础重复"，始终写入并回读校验；
+   `_windows_task_problems` 也按同一口径比对，`repair` 能原地补回。
+2. **next_run 被算成"今天的触发时分"**：`_windows_next_run` 只认 `<DaysInterval>`，其余类型
+   退化为"今天/明天在触发时分"，且该值会覆盖库里的正确值（hourly 于是显示成明天）。
+   修法：直接读任务计划程序的 `NextRunTime`，各类型统一。
+3. **weekly 同日被跳过**：`days_ahead <= 0` 一律 +7 天，今天就是目标星期且时间未到时
+   被排到下周。修法：先按当天算，时间已过才 +7。
+4. **每月任务设置落不下**：`Set-ScheduledTask -Trigger $tr -Settings $s` 对月度触发器报
+   `0x80070057 参数错误`，连带电源设置失败（电池/睡眠下到点不跑）。
+   修法：设置与触发器分两次调用，只有真要改重复时才回传 `-Trigger`。
+
+探针脚本：`tests/probe_schedule_types.py`（隔离库逐类型比对 `next_run` 与系统 `NextRunTime`）。
+
 ## 目录
 
 ```
@@ -115,6 +167,7 @@ scripts/task_utf8_wrapper.py 子进程 UTF-8 包装（含 CREATE_NO_WINDOW）
 schedule.ps1 / .bat          全局命令包装
 setup_global.ps1 / .bat      安装到全局 PATH
 examples/                    示例任务与脚本
+tests/test_repair_rules.py   repair 判定规则回归测试（unittest）
 ```
 
 ## 使用

@@ -537,6 +537,11 @@ CREATE TABLE execution_logs (
 - 清理系统里已无数据库记录的孤儿实体：`schedule repair --prune`
 - 判定规则：实体缺失 / 入口命令不符 / 触发器与库里调度不一致 → 整条重建；
   只有电源设置或启用状态不符 → 原地修正（保留历史与统计）
+- 判定只看库里的实际值：`retry_count = 0`（`--retry-count 0` 关闭重试）就是"不写失败重启"，
+  不会被默认值 3 顶掉；`status = failed`（上次执行失败）也算"应保持启用"，
+  `repair` 不会因此禁用实体或清掉 `next_run`
+- 「每 N 天」还会校相位：StartBoundary 的日期必须落在"上次按点执行 + N 天"的网格上，
+  不符就原地重钉（表里显示 `触发日期 2026-11-14 != 2026-11-16`），保留运行历史与统计
 - 重建时用库里的 `next_run` 作网格锚点，保住"每 N 天"任务的相位，不会被挪到今天
 
 ### `update` 改了，但任务计划程序里没变化
@@ -559,6 +564,55 @@ CREATE TABLE execution_logs (
   仍失败会明确报错并以非 0 退出，同时提示去管理员 PowerShell 处理
 - 手工确认：`schtasks /Query /TN "TaskScheduler-<id>-<名称>" /XML | findstr /C:"RestartOnFailure" /C:"Count" /C:"Interval"`
 - 受限时：在**管理员 PowerShell** 里执行 `schedule repair`
+
+### `repair` 擅自加了「失败重启 3 次」／把失败的任务当成暂停（已修复）
+- 症状一：库里明明是 `--retry-count 0`（关闭重试），`schedule repair` 却报
+  `失败重启次数 未设置 != 3`，还把它写进任务计划程序（VERIFY 里 `RST=PT1M/3`）
+- 症状二：任务上次执行失败（库里 `status=failed`）后，`repair` 报
+  「系统里是 Ready，但库里是 paused」并禁用实体、清掉 `next_run`
+- 原因：`load_tasks` 用 `row[19] or 3` 读重试次数，0 被当成"没设过"抬回默认 3；
+  状态判定又只认 `status == "active"`，失败态于是被当成用户主动暂停
+- 现在的处理：0 按 0 读（只有 NULL 才回落默认 3 / 60），`active` / `running` / `failed`
+  都算"应保持启用"；`repair` 只报真实差异，不再擅自新增失败重启或停用任务；
+  系统侧若残留 3 次，会按库里的 0 清掉
+- 回归测试：`python -m unittest discover -s tests -v`
+
+### `update` 改完触发时间，下次执行时间差了一天（每 N 天变成隔天跑）（已修复）
+- 症状一：`--every-days 3 21:02` 的任务 11-13 21:02 刚执行过，`schedule list` 与任务计划程序
+  却都显示下次 11-14 21:02
+- 症状二：把「每 3 天」改成「每 5 天」后，只有时分变了，日期没跟着往后走
+- 原因：`next_run` 曾固定按 `created_at` 的日期网格重算，`update` 又把这个错值当锚点
+  钉回系统，相位越挪越偏
+- 现在的处理：`Task.grid_anchor` 显式存"每 N 天"的网格起点（老库自动补列、按上次执行补值）：
+  - `update` 改间隔/时刻时把锚点重置到**上次真正执行那天**，所以 3 天改 5 天，日期会跟着走；
+    只改时分则保持原日期
+  - 手动 `run-now` 不动锚点，测试任务不会把排期挪走
+  - `repair` 发现 StartBoundary 日期不在网格上就**原地重钉**（`触发日期 2026-11-16 != 2026-11-18`），
+    不重建、保留历史与统计
+- 受限时：实体由更高权限创建（任务文件对当前用户只读）会 `Access is denied`，
+  需要在**管理员 PowerShell** 里执行 `schedule repair`
+
+### 每小时 / 每 N 分钟的任务只跑一次（已修复）
+- 症状：`--hourly` 或 `--interval 30m` 建好后，任务计划程序里「下次运行时间」是空的，
+  跑过一次就再也不触发
+- 原因：`schtasks /SC HOURLY|MINUTE` 是用「TimeTrigger + `<Repetition>`」实现间隔的；
+  旧版 `_apply_windows_task_settings` 在没有 `--repeat` 时无条件 `$tr.Repetition = $null`，
+  把调度本身清掉了
+- 现在的处理：`hourly` / `interval` 的重复就是调度本身，按周期写入并回读校验；
+  `repair` 会报 `重复间隔 未设置 != PT30M` 并原地补回（不重建）
+
+### 每周 / 每月 / 每小时任务的下次执行时间算错（已修复）
+- 症状：hourly 任务的下次执行显示成"明天同一时刻"；weekly 任务今天就是目标星期、
+  且时间还没到，却被排到下週
+- 原因：`_windows_next_run` 只会按 `<DaysInterval>` 复算，其余调度退化成"今天的触发时分"，
+  再把这个错值覆盖回库；weekly 分支又把 `days_ahead <= 0` 一律 +7 天
+- 现在的处理：`next_run` 直接取任务计划程序算好的 `NextRunTime`（各类型统一）；
+  weekly 同一天且时间未到就排今天
+
+### 每月任务拿不到电池/补跑设置（已修复）
+- 原因：`Set-ScheduledTask -Trigger $tr -Settings $s` 对月度触发器会报
+  `0x80070057 参数错误`，连带电源设置一起失败，任务在电池/睡眠场景下"到点不跑"
+- 现在的处理：设置与触发器分两次落盘，只有真要改「重复间隔」时才回传 `-Trigger`
 
 ### 序号想从 1 开始连续
 - 一条命令压实：`schedule renumber`（保持现有顺序，把 id 改成 1..N）

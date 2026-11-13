@@ -116,11 +116,24 @@ class Task:
     # repeat_duration 为空表示「无限期」持续（Windows 上不写 Duration）。
     repeat_interval: Optional[str] = None
     repeat_duration: Optional[str] = None
+    # 「每 N 天」的网格起点（某个真实执行/初始排期的时间点）。相位只认它：
+    # 手动 run-now 不会挪动网格；`update` 改间隔时把它重置到上次执行那天。
+    grid_anchor: Optional[str] = None
 
 
 # 「本次调用没有提供该字段」的哨兵。update_task 用它区分“没传”和“传了空值/None”：
 # 前者保持原值，后者才是真的要清空（例如 --group "" 清掉分组）。
 _UNSET = object()
+
+# 库里「仍应按时执行」的状态。failed / running 只是执行结果，不是用户的暂停意图：
+# 失败一次就当成停用，会让 repair 把系统实体禁用掉、还清掉 next_run ——
+# 于是"修复"反而把任务弄成到点不跑。只有 paused / disabled 才算用户要求停止。
+SCHEDULABLE_STATUSES = ("active", "running", "failed")
+
+
+def is_schedulable(task: "Task") -> bool:
+    """任务是否应保持启用（active / running / failed 都算）。"""
+    return (task.status or "active") in SCHEDULABLE_STATUSES
 
 
 class SafePrint:
@@ -303,14 +316,15 @@ class DatabaseManager:
                     retry_count INTEGER DEFAULT 3,
                     retry_delay INTEGER DEFAULT 60,
                     repeat_interval TEXT,
-                    repeat_duration TEXT
+                    repeat_duration TEXT,
+                    grid_anchor TEXT
                 )
             ''')
             
             # 旧库补列（v2.0 早期建的表没有重复触发字段）：
             # SQLite 不支持 ADD COLUMN IF NOT EXISTS，用 PRAGMA 查一遍再补。
             existing = {row[1] for row in cursor.execute('PRAGMA table_info(tasks)')}
-            for column in ('repeat_interval', 'repeat_duration'):
+            for column in ('repeat_interval', 'repeat_duration', 'grid_anchor'):
                 if column not in existing:
                     cursor.execute(f'ALTER TABLE tasks ADD COLUMN {column} TEXT')
             
@@ -344,8 +358,8 @@ class DatabaseManager:
                         fail_count, group_name, depends_on, working_dir,
                         env_vars, notify_on_success, notify_on_fail,
                         slack_webhook, email, retry_count, retry_delay,
-                        repeat_interval, repeat_duration
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        repeat_interval, repeat_duration, grid_anchor
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     task.id, task.name, task.command, task.schedule_type,
                     task.schedule_value, task.status, task.created_at,
@@ -354,7 +368,8 @@ class DatabaseManager:
                     task.working_dir, json.dumps(task.env_vars),
                     task.notify_on_success, task.notify_on_fail,
                     task.slack_webhook, task.email, task.retry_count,
-                    task.retry_delay, task.repeat_interval, task.repeat_duration
+                    task.retry_delay, task.repeat_interval, task.repeat_duration,
+                    task.grid_anchor
                 ))
                 conn.commit()
                 return True
@@ -392,10 +407,14 @@ class DatabaseManager:
                         notify_on_fail=row[16],
                         slack_webhook=row[17],
                         email=row[18],
-                        retry_count=row[19] or 3,
-                        retry_delay=row[20] or 60,
+                        # 0 是**合法值**（--retry-count 0 = 关闭重试），不能被 `or 3`
+                        # 当成"没设过"再抬回 3：那会让 repair/update 把用户明确关掉的
+                        # 失败重启策略又写回任务计划程序。只有 NULL（老库缺列）才取默认。
+                        retry_count=row[19] if row[19] is not None else 3,
+                        retry_delay=row[20] if row[20] is not None else 60,
                         repeat_interval=row[21] if len(row) > 21 else None,
-                        repeat_duration=row[22] if len(row) > 22 else None
+                        repeat_duration=row[22] if len(row) > 22 else None,
+                        grid_anchor=row[23] if len(row) > 23 else None
                     )
                     tasks.append(task)
         except Exception as e:
@@ -574,46 +593,66 @@ class TaskScheduler:
         """兼容保留：委托给模块级 _fmt_ts（格式定义只应有一处）"""
         return _fmt_ts(dt)
 
+    @staticmethod
+    def _next_from_start_boundary(sb: str,
+                                  days_interval: str) -> Optional[str]:
+        """由系统实体的 StartBoundary + DaysInterval 复算下一次触发时间。"""
+        if not sb:
+            return None
+        try:
+            anchor = datetime.fromisoformat(sb)
+        except ValueError:
+            return None
+        try:
+            step_days = max(1, int(days_interval)) if days_interval else 1
+        except ValueError:
+            step_days = 1
+        now = datetime.now()
+        cand = anchor
+        if cand <= now:
+            step = timedelta(days=step_days)
+            cand += step * ((now - cand) // step + 1)
+        return cand.isoformat()
+
     def _windows_next_run(self, task: Task) -> Optional[str]:
         """以 Windows 的 StartBoundary + DaysInterval 为权威源推算 next_run。
 
         为什么不从 created_at 推：Windows 的网格锚点其实是 **StartBoundary**（整点），
         而任务的 created_at 带时分秒，两者网格对不齐 —— 重建任务后曾出现 DB 记
-        2026-09-16 而 Windows 实为 2026-09-15 的差一天偏差。这里直接读 XML 的
-        权威输入复算，保证 DB 与系统一致（该值用于展示与丢失检测）。
-        读不到时返回 None，由调用方回退到 _calculate_next_run。
+        2026-09-16 而 Windows 实为 2026-09-15 的差一天偏差。
+
+        这里直接问任务计划程序要它算好的 `NextRunTime`：每天 / 每 N 天 / 每周 /
+        每月 / 每小时 / 每 N 分钟的排期都由系统自己维护，比在本地按 XML 复算可靠。
+        旧实现只识别了 DaysInterval，其余类型一律按"今天的触发时分"去猜 ——
+        hourly 任务的下次执行因此被显示成"明天同一时刻"。
+        读不到（任务暂停 / PowerShell 不可用）时返回 None，由调用方回退。
         """
         if self.platform != Platform.WINDOWS:
             return None
         if task.schedule_type == "startup":
-            # ONLOGON 触发器没有 StartBoundary 网格，交给 Windows 自己决定
+            # ONLOGON 触发器没有确定的触发时刻
             return None
         task_name = f"TaskScheduler-{task.id}-{task.name.replace(' ', '_')}"
+        safe = task_name.replace("'", "''")
+        ps = ("$ErrorActionPreference='Stop';"
+              f"$i = Get-ScheduledTaskInfo -TaskName '{safe}';"
+              "if ($i.NextRunTime) { $i.NextRunTime.ToString('yyyy-MM-ddTHH:mm:ss') }")
         try:
-            r = subprocess.run(['schtasks', '/Query', '/TN', task_name, '/XML'],
-                               capture_output=True, encoding='utf-8', errors='replace')
-            if r.returncode != 0 or not r.stdout:
-                return None
-            m = re.search(r"<StartBoundary>([^<]+)</StartBoundary>", r.stdout)
-            if not m:
-                return None
-            anchor = datetime.fromisoformat(m.group(1))
-            di = re.search(r"<DaysInterval>(\d+)</DaysInterval>", r.stdout)
-            now = datetime.now()
-            if di:                                   # every_days：按 DaysInterval 递推
-                step = timedelta(days=max(1, int(di.group(1))))
-                cand = anchor
-                if cand <= now:
-                    cand += step * ((now - cand) // step + 1)
-                return cand.isoformat()
-            # daily/weekly/monthly：XML 无 Interval 节点时退回"取时刻、今天或明天"
-            cand = now.replace(hour=anchor.hour, minute=anchor.minute,
-                               second=0, microsecond=0)
-            if cand <= now:
-                cand += timedelta(days=1)
-            return cand.isoformat()
-        except Exception:                                          # noqa: BLE001
+            r = subprocess.run(['powershell', '-NoProfile', '-NonInteractive',
+                                '-Command', ps],
+                               capture_output=True, text=True,
+                               encoding='utf-8', errors='replace')
+        except FileNotFoundError:
             return None
+        out = (r.stdout or "").strip()
+        if not out:
+            return None
+        value = out.splitlines()[-1].strip()
+        try:
+            datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return value
 
     def _sync_next_run_with_windows(self, task: Task) -> bool:
         """把 DB 的 next_run 对齐到 Windows 权威值；有变化则写库。返回是否已更新。
@@ -621,10 +660,13 @@ class TaskScheduler:
         暂停的任务没有触发计划，不回填：否则库里会留下“暂停中却仍有 next_run”
         的陈旧值（显示层虽已屏蔽，但导出/直接读库会被误导）。
         """
-        if task.status != "active":
+        if not is_schedulable(task):
             return False
+        anchor_added = self._ensure_grid_anchor(task)
         wn = self._windows_next_run(task)
         if not wn or wn == task.next_run:
+            if anchor_added:
+                self.db.save_task(task)
             return False
         task.next_run = wn
         self.db.save_task(task)
@@ -652,27 +694,9 @@ class TaskScheduler:
                 return next_run.isoformat()
             
             elif task.schedule_type == "every_days":
-                days_part, time_str = task.schedule_value.split('|')
-                days = max(1, int(days_part))
-                hour, minute = map(int, time_str.split(':'))
-                # Windows 的 DaysInterval 以任务创建时的 StartBoundary 为锚点按 N 天
-                # 递推，所以这里也用 created_at 的日期做网格，而不是按 last_run 推算
-                # （last_run 含手动执行，会把下次执行时间算晚，DB 与系统任务就对不上了）
-                step = timedelta(days=days)
-                anchor = now
-                if task.created_at:
-                    try:
-                        anchor = datetime.fromisoformat(task.created_at)
-                    except ValueError:
-                        anchor = now
-                candidate = datetime(anchor.year, anchor.month, anchor.day, hour, minute, 0, 0)
-                if candidate <= now:
-                    # 直接跳到 now 之后最近的网格点，避免逐日循环
-                    jumps = (now - candidate) // step + 1
-                    candidate += step * jumps
-                while candidate <= now:
-                    candidate += step
-                return candidate.isoformat()
+                # 网格相位统一交给 _every_days_next_run（按"上次按点执行"推，
+                # 不再按 created_at —— 那会在 StartBoundary 被重钉后错开一天）
+                return self._every_days_next_run(task)
             
             elif task.schedule_type == "weekly":
                 parts = task.schedule_value.split()
@@ -681,12 +705,12 @@ class TaskScheduler:
                 time_str = parts[1]
                 hour, minute = map(int, time_str.split(':'))
                 
-                days_ahead = target_day - now.weekday()
-                if days_ahead <= 0:
-                    days_ahead += 7
-                
-                next_run = now + timedelta(days=days_ahead)
-                next_run = next_run.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                days_ahead = (target_day - now.weekday()) % 7
+                next_run = (now + timedelta(days=days_ahead)).replace(
+                    hour=hour, minute=minute, second=0, microsecond=0)
+                if next_run <= now:
+                    # 今天就是目标星期、但时间已过：顺延一周
+                    next_run += timedelta(days=7)
                 return next_run.isoformat()
             
             elif task.schedule_type == "monthly":
@@ -761,6 +785,9 @@ class TaskScheduler:
         )
         
         task.next_run = self._calculate_next_run(task)
+        if task.schedule_type == 'every_days' and task.next_run:
+            # 首次排期即网格起点：之后改间隔就以它为基准重定相位
+            task.grid_anchor = task.next_run
         
         # 保存到数据库
         if not self.db.save_task(task):
@@ -909,14 +936,16 @@ class TaskScheduler:
             return True
 
         # ---- 重算 next_run ----
-        old_next_run = task.next_run
         schedule_changed = (draft.schedule_type, draft.schedule_value) != (
             task.schedule_type, task.schedule_value)
         if draft.status == 'paused':
             draft.next_run = None
         elif schedule_changed:
-            if draft.schedule_type == 'every_days' and old_next_run:
-                draft.next_run = self._every_days_next_run(draft, old_next_run)
+            if draft.schedule_type == 'every_days':
+                # 改「每 N 天」的间隔或时刻：网格从上次真正执行那天重新起算，
+                # 所以 3 天改 5 天时日期会跟着往后走，而不是只换时分。
+                draft.grid_anchor = self._pick_grid_anchor(task)
+                draft.next_run = self._every_days_next_run(draft)
             else:
                 draft.next_run = self._calculate_next_run(draft)
         elif task.status == 'paused':
@@ -940,7 +969,7 @@ class TaskScheduler:
             self._remove_system_scheduler(task)
 
         anchor = None
-        if (draft.status == 'active' and draft.next_run
+        if (is_schedulable(draft) and draft.next_run
                 and draft.schedule_type in ('daily', 'every_days', 'weekly', 'monthly')):
             try:
                 anchor = datetime.fromisoformat(draft.next_run)
@@ -985,25 +1014,64 @@ class TaskScheduler:
                         "请用管理员 PowerShell 执行 `schedule repair` 重建")
         return False
 
-    def _every_days_next_run(self, task: Task, old_next_run: str) -> Optional[str]:
-        """every_days 改时间时，沿用旧 next_run 的日期网格 + 新调度的时间。
+    def _every_days_next_run(self, task: Task,
+                             reference: Optional[str] = None) -> Optional[str]:
+        """每 N 天：在网格上取「第一个不早于现在」的执行时刻。
 
-        直接调 _calculate_next_run 会按 created_at 重算网格，相位可能整体挪位
-        （14 天体检之类的任务被挪到明天）。这里以旧 next_run 的日期为锚点，按
-        新的 N 天步长递推到 now 之后。
+        网格起点（锚点）优先 `grid_anchor`，再依次退回上次执行、已有 next_run、
+        created_at。`grid_anchor` 是显式存下来的：手动 `run-now` 不改它，所以相位
+        不会被手动测试挪走；`update` 改间隔时把它重置到"上次执行那天"，
+        「每 3 天」改成「每 5 天」的日期就会跟着往后走，而不是只换时分。
         """
         try:
-            old = datetime.fromisoformat(old_next_run)
             days_part, time_part = task.schedule_value.split('|')
             step = timedelta(days=max(1, int(days_part)))
             hour, minute = map(int, time_part.split(':'))
         except (TypeError, ValueError):
-            return self._calculate_next_run(task)
-        candidate = old.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            return None
+
+        base: Optional[datetime] = None
+        for raw in (reference, task.grid_anchor, task.last_run,
+                    task.next_run, task.created_at):
+            if not raw:
+                continue
+            try:
+                base = datetime.fromisoformat(raw)
+                break
+            except (TypeError, ValueError):
+                continue
+        if base is None:
+            base = datetime.now()
+
+        candidate = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
         now = datetime.now()
         while candidate <= now:
             candidate += step
         return candidate.isoformat()
+
+    @staticmethod
+    def _pick_grid_anchor(old: Task) -> Optional[str]:
+        """给「每 N 天」挑一个网格起点：优先上次真正执行的时间点。
+
+        没有执行历史时退回现有锚点 / next_run / created_at；改间隔时用它重定相位，
+        新任务则用它做初始网格。
+        """
+        for raw in (old.last_run, old.grid_anchor, old.next_run, old.created_at):
+            if not raw:
+                continue
+            try:
+                datetime.fromisoformat(raw)
+            except (TypeError, ValueError):
+                continue
+            return raw
+        return None
+
+    def _ensure_grid_anchor(self, task: Task) -> bool:
+        """老库（没有 grid_anchor 列值）升级时补一个网格起点。改了返回 True。"""
+        if task.schedule_type != 'every_days' or task.grid_anchor:
+            return False
+        task.grid_anchor = self._pick_grid_anchor(task)
+        return task.grid_anchor is not None
 
     def _setup_system_scheduler(self, task: Task,
                                 anchor: Optional[datetime] = None) -> bool:
@@ -1100,13 +1168,13 @@ class TaskScheduler:
                 # 必须显式改写，否则任务会"已启用但到点不执行"。
                 # 设置没落盘就别报成功：调用方据此决定是否重试/报错。
                 settings_ok = self._apply_windows_task_settings(
-                    task, enabled=(task.status == "active"))
+                    task, enabled=is_schedulable(task))
                 # 让 DB 的 next_run 对齐 Windows 权威网格（StartBoundary + DaysInterval）。
                 # 用 created_at 推算会与系统差一天（整点锚点 vs 带时分秒的创建时刻）。
                 # 暂停的任务没有触发计划，绝不把网格回填进库（否则库里会留下
                 # “暂停中却仍有 next_run”的陈旧值，与 pause_task 的语义矛盾）。
                 if sync_db:
-                    if task.status == "active":
+                    if is_schedulable(task):
                         if self._sync_next_run_with_windows(task):
                             SafePrint.info(f"next_run 已按 Windows 网格校准为 {task.next_run}")
                     elif task.next_run is not None:
@@ -1187,7 +1255,16 @@ class TaskScheduler:
         # 触发器的「重复间隔 / 持续时间」：schtasks /Create 没有对应参数，只能在建好后
         # 改触发器。这里借 New-ScheduledTaskTrigger 生成 Repetition 模板再塞给现有触发器，
         # 一次 Set-ScheduledTask 同时落设置与触发器。
-        rep_interval = _repeat_spec_seconds(task.repeat_interval)
+        #
+        # ⚠️ hourly / interval 的「重复」就是调度本身：`schtasks /SC HOURLY|MINUTE`
+        # 生成的是 TimeTrigger + <Repetition>，不能当成"多余的 --repeat"清掉 ——
+        # 清掉后任务只剩一次性触发（NextRunTime 为空），到点再也不会跑。
+        rep_spec = task.repeat_interval
+        if not rep_spec and task.schedule_type == 'hourly':
+            rep_spec = '1h'
+        elif not rep_spec and task.schedule_type == 'interval':
+            rep_spec = task.schedule_value
+        rep_interval = _repeat_spec_seconds(rep_spec)
         rep_duration = _repeat_spec_seconds(task.repeat_duration) if rep_interval else None
         if rep_interval:
             rep_ps = (
@@ -1199,21 +1276,29 @@ class TaskScheduler:
                 "$tr.Repetition = $tmpl.Repetition;"
                 # 持续时间到了不要顺手掐掉正在跑的那一次
                 "$tr.Repetition.StopAtDurationEnd = $false;"
+                "$changed = $true;"
             )
         else:
-            rep_ps = "$tr.Repetition = $null;"
+            # 只清"残留的 --repeat"：本来就没有重复的日历触发不要碰
+            rep_ps = ("if ($tr.Repetition -and $tr.Repetition.Interval) "
+                      "{ $tr.Repetition = $null; $changed = $true };")
 
         ps_script = (
             "$ErrorActionPreference='Stop';"
             "$name = '" + safe_name + "';"
-            "$t = Get-ScheduledTask -TaskName $name;"
-            "$tr = $t.Triggers[0];"
-            + rep_ps +
+            # 设置与触发器分两步落：月度触发器回传 -Trigger 会被系统判成
+            # "参数错误"(0x80070057)，把同一调用里的设置一起带崩（实测 monthly 任务
+            # 因此永远拿不到电池/补跑设置）。只有真要改重复时才第二次动触发器。
             "$s = New-ScheduledTaskSettingsSet "
             "-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable "
             "-MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 72)"
             + restart_arg + ";"
-            "Set-ScheduledTask -TaskName $name -Trigger $tr -Settings $s | Out-Null;"
+            "Set-ScheduledTask -TaskName $name -Settings $s | Out-Null;"
+            "$t = Get-ScheduledTask -TaskName $name;"
+            "$tr = $t.Triggers[0];"
+            "$changed = $false;"
+            + rep_ps +
+            "if ($changed) { Set-ScheduledTask -TaskName $name -Trigger $tr | Out-Null };"
             f"{state_cmd} -TaskName $name | Out-Null;"
             # 回读校验：命令返回 0 只说明调用没报错，不等于设置真的落盘。
             # 这里把实际生效值读回来，失败即判为未生效，避免"任务已建但设置没应用"。
@@ -1451,13 +1536,41 @@ class TaskScheduler:
                        + (f" | {(r.stderr or '').strip()}" if r.returncode != 0 else ""))
         return False
 
-    def _repair_anchor(self, task: Task) -> Optional[datetime]:
-        """用库里 next_run 反推一个不早于现在的网格锚点。
+    def _realign_every_days(self, task: Task, task_name: str) -> bool:
+        """把「每 N 天」的 StartBoundary 钉回与上次执行同一相位，并回填 next_run。
 
-        只对日历型调度有意义：daily 用当天/明天，every_days 按 DaysInterval 递推。
-        startup/hourly/interval 没有日历网格，返回 None 交给系统自己排。
+        只用于原地校准（不重建实体），保留运行历史与统计。锚点取
+        `_every_days_next_run`：上次按点执行 + N 天，递推到 now 之后。
         """
-        if task.schedule_type not in ("daily", "every_days", "weekly", "monthly"):
+        wanted = self._every_days_next_run(task)
+        try:
+            anchor = datetime.fromisoformat(wanted) if wanted else None
+        except ValueError:
+            anchor = None
+        if anchor is None:
+            SafePrint.warn(f"无法推算 '{task.name}' 的网格锚点，跳过相位校准")
+            return False
+        if not self._set_windows_start_boundary(task_name, anchor):
+            return False
+        self._sync_next_run_with_windows(task)
+        return True
+
+    def _repair_anchor(self, task: Task) -> Optional[datetime]:
+        """重建时用来钉住"每 N 天"相位的网格锚点（不早于现在）。
+
+        every_days 直接用 `_every_days_next_run`（按上次按点执行推），
+        其余日历型调度沿用库里的 next_run。startup/hourly/interval 没有日历
+        网格，返回 None 交给系统自己排。
+        """
+        now = datetime.now()
+        if task.schedule_type == "every_days":
+            wanted = self._every_days_next_run(task)
+            try:
+                anchor = datetime.fromisoformat(wanted) if wanted else None
+            except ValueError:
+                anchor = None
+            return anchor if anchor and anchor > now else None
+        if task.schedule_type not in ("daily", "weekly", "monthly"):
             return None
         if not task.next_run:
             return None
@@ -1465,23 +1578,16 @@ class TaskScheduler:
             anchor = datetime.fromisoformat(task.next_run)
         except ValueError:
             return None
-        now = datetime.now()
-        if task.schedule_type == "every_days":
-            try:
-                step = max(1, int(task.schedule_value.split("|")[0]))
-            except (ValueError, IndexError):
-                step = 1
-            while anchor <= now:
-                anchor += timedelta(days=step)
         if anchor <= now:
             return None
         return anchor
 
     def _windows_task_problems(self, task: Task, info: Dict[str, str],
-                               state: str) -> Tuple[List[str], List[str]]:
-        """把系统实体与数据库对不上的地方分类：需整条重建 / 只需改设置。"""
+                               state: str) -> Tuple[List[str], List[str], List[str]]:
+        """把系统实体与数据库对不上的地方分类：整条重建 / 改设置 / 校准相位。"""
         rebuild: List[str] = []
         fix: List[str] = []
+        realign: List[str] = []
 
         want_cmd = self._windows_run_cmd(task)
         actual_cmd = f"{info.get('command', '')} {info.get('arguments', '')}".strip()
@@ -1508,6 +1614,17 @@ class TaskScheduler:
                 rebuild.append(f"触发时间 {got_time or '?'} != {parts[1]}")
         # startup(ONLOGON) 没有日历网格，不校验时间
 
+        # 「每 N 天」的网格相位：StartBoundary 的日期必须和"上次按点执行 + N 天"
+        # 落在同一网格上。旧版按 created_at 重算 next_run，一旦 StartBoundary 被
+        # update/repair 重新钉过就会错开一天（实测「11-13 跑过、系统排 11-14」，
+        # 每 3 天变成隔天跑）。这类偏差原地重钉 StartBoundary 即可，不必整条重建。
+        if task.schedule_type == "every_days" and is_schedulable(task):
+            want_next = self._every_days_next_run(task)
+            got_next = self._next_from_start_boundary(
+                info.get("start_boundary", ""), info.get("days_interval", ""))
+            if want_next and got_next and want_next[:16] != got_next[:16]:
+                realign.append(f"触发日期 {got_next[:10]} != {want_next[:10]}")
+
         if info.get("dib") != "false":
             fix.append(f"DisallowStartIfOnBatteries={info.get('dib') or '?'}")
         if info.get("sib") != "false":
@@ -1531,9 +1648,16 @@ class TaskScheduler:
             fix.append(f"失败重启 {got_interval or '?'}/{got_count} != 关闭")
 
         # 触发器重复间隔 / 持续时间（空 duration 表示无限期）
+        # hourly / interval 的「重复」就是调度本身：schtasks 用 TimeTrigger + Repetition
+        # 实现，不能按 --repeat 判成"多余重复"清掉，否则任务只剩一次性触发。
         want_repeat = _repeat_spec_seconds(task.repeat_interval)
+        if not want_repeat:
+            if task.schedule_type == "hourly":
+                want_repeat = 3600
+            elif task.schedule_type == "interval":
+                want_repeat = _repeat_spec_seconds(task.schedule_value)
         want_repeat_duration = (_repeat_spec_seconds(task.repeat_duration)
-                                if want_repeat else None)
+                                if want_repeat and task.repeat_interval else None)
         got_repeat = info.get("repeat_interval") or ""
         got_repeat_duration = info.get("repeat_duration") or ""
         if want_repeat:
@@ -1550,11 +1674,11 @@ class TaskScheduler:
             fix.append(f"重复间隔 {got_repeat} != 关闭")
 
         if state:
-            if task.status == "active" and state == "Disabled":
-                fix.append("系统里是 Disabled，但库里是 active")
-            elif task.status != "active" and state != "Disabled":
-                fix.append(f"系统里是 {state}，但库里是 paused")
-        return rebuild, fix
+            if is_schedulable(task) and state == "Disabled":
+                fix.append(f"系统里是 Disabled，但库里是 {task.status}（应保持启用）")
+            elif not is_schedulable(task) and state != "Disabled":
+                fix.append(f"系统里是 {state}，但库里是 {task.status}（应保持停用）")
+        return rebuild, fix, realign
 
     def _windows_entity_problems(self, task: Task) -> List[str]:
         """回读系统实体，返回与库里记录不一致的项（空列表 = 一致）。
@@ -1569,9 +1693,9 @@ class TaskScheduler:
         info = self._query_windows_task(tname)
         if info is None:
             return ["系统里不存在"]
-        rebuild, fix = self._windows_task_problems(
+        rebuild, fix, realign = self._windows_task_problems(
             task, info, self._query_windows_state(tname))
-        return rebuild + fix
+        return rebuild + fix + realign
 
     def _ensure_system_task(self, task: Task,
                             anchor: Optional[datetime] = None) -> bool:
@@ -1660,12 +1784,19 @@ class TaskScheduler:
         判定规则：
         - 实体缺失、入口命令不符、触发器与库里调度对不上 → 整条重建
         - 只有电源/补偿设置或启用状态不符 → 原地修正，不重建（保留历史与统计）
+        - 「每 N 天」的 StartBoundary 日期不在网格上（与上次执行不同相位）→ 原地重钉
         - 库里没有对应记录的孤儿实体 → 默认只报告，--prune 才删
         """
         targets = [t for t in self.tasks if not only or t.name == only]
-        if only and not targets:
+        if not targets:
             SafePrint.error(f"任务 '{only}' 不存在")
             return False
+
+        # 老库补网格锚点：没有它就无法判断「每 N 天」的相位是否被挪过
+        if not dry_run:
+            for task in targets:
+                if self._ensure_grid_anchor(task):
+                    self.db.save_task(task)
 
         rows: List[Tuple[str, str, str]] = []
         all_ok = True
@@ -1697,7 +1828,7 @@ class TaskScheduler:
                 continue
 
             state = self._query_windows_state(tname)
-            rebuild, fix = self._windows_task_problems(task, info, state)
+            rebuild, fix, realign = self._windows_task_problems(task, info, state)
 
             if rebuild:
                 if dry_run:
@@ -1709,18 +1840,24 @@ class TaskScheduler:
                 all_ok = all_ok and ok
                 continue
 
-            if fix:
+            if fix or realign:
                 if dry_run:
-                    rows.append((task.name, "将修正", "；".join(fix)))
+                    rows.append((task.name, "将修正", "；".join(fix + realign)))
                     all_ok = False
                     continue
-                ok = self._apply_windows_task_settings(task, enabled=(task.status == "active"))
-                rows.append((task.name, "已修正" if ok else "失败", "；".join(fix)))
+                ok = True
+                if fix:
+                    ok = self._apply_windows_task_settings(
+                        task, enabled=is_schedulable(task))
+                if realign:
+                    ok = self._realign_every_days(task, tname) and ok
+                rows.append((task.name, "已修正" if ok else "失败",
+                             "；".join(fix + realign)))
                 all_ok = all_ok and ok
                 continue
 
             if not dry_run:
-                if task.status == "active":
+                if is_schedulable(task):
                     self._sync_next_run_with_windows(task)
                 elif task.next_run is not None:
                     # 暂停任务不该有 next_run，顺手清掉陈旧值
@@ -2316,8 +2453,11 @@ class TaskScheduler:
                 output = f"[无标准输出]\n[错误输出]: {error[:1000]}"
             
             # 更新任务状态
+            # next_run 以系统实体（StartBoundary + DaysInterval）为准：那才是真正会
+            # 触发的网格。旧实现按 created_at 重算，StartBoundary 被重钉过之后就会
+            # 算错一天（"每 3 天"变成隔天跑），执行完立刻就和系统对不上。
             task.last_run = self._fmt_ts(start_time)
-            task.next_run = self._calculate_next_run(task)
+            task.next_run = self._windows_next_run(task) or self._calculate_next_run(task)
             
             if result.returncode == 0:
                 SafePrint.success(f"任务执行成功 (耗时: {duration:.1f}秒)")
@@ -2622,6 +2762,8 @@ class TaskScheduler:
 
         # next_run 不照搬：暂停的任务没有触发计划，启用的任务按本机时钟重算
         kwargs.pop('next_run', None)
+        # 网格锚点同样不照搬：相位要按本机的执行历史重推
+        kwargs.pop('grid_anchor', None)
         return kwargs
 
     def import_config(self, input_file: str, overwrite: bool = False,
